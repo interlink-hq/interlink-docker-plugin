@@ -57,7 +57,14 @@ func (h *SidecarHandler) DeleteHandler(w http.ResponseWriter, r *http.Request) {
 
 	for _, container := range pod.Spec.Containers {
 		containerName := podNamespace + "-" + podUID + "-" + container.Name
-		h.FPGAManager.Release(containerName)
+		// if the FPGA manager is nil we don't need to release the container
+		if h.FPGAManager != nil {
+			// release the container from the FPGA manager
+			err = h.FPGAManager.Release(containerName)
+			if err != nil {
+				log.G(h.Ctx).Error("\u274C [DELETE CALL] Error releasing container " + containerName)
+			}
+		}
 	}
 
 	log.G(h.Ctx).Debug("\u2705 [DELETE CALL] Deleting POD " + podUID + "_dind")

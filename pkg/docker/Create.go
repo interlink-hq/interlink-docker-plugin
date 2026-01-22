@@ -2,6 +2,7 @@ package docker
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -25,7 +26,7 @@ import (
 	trace "go.opentelemetry.io/otel/trace"
 )
 
-func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w http.ResponseWriter, podIp string) ([]DockerRunStruct, error) {
+func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w http.ResponseWriter) ([]DockerRunStruct, error) {
 
 	var dockerRunStructs []DockerRunStruct
 	var fpgaArgs string = ""
@@ -91,6 +92,12 @@ func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w 
 				if numFPGAsRequested == 0 {
 					log.G(h.Ctx).Info("\u2705 Container " + containerName + " is not requesting a FPGA")
 				} else {
+
+					if h.FPGAManager == nil {
+						log.G(h.Ctx).Error("\u274C [CREATE CALL] FPGA Manager is not initialized")
+						HandleErrorAndRemoveData(h, w, "FPGA Manager is not initialized", errors.New("FPGA Manager is not initialized"), podNamespace, podUID)
+						return dockerRunStructs, errors.New("FPGA Manager is not initialized")
+					}
 
 					isFPGARequested = true
 					log.G(h.Ctx).Info("\u2705 Container " + containerName + " is requesting " + strconv.Itoa(int(numFPGAsRequested)) + " FPGA(s)")
@@ -353,54 +360,14 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 
 		podDirectoryPath := filepath.Join(wd, h.Config.DataRootFolder+"/"+podNamespace+"-"+podUID)
 
-		podIpAddress := ""
+		// log the pod specifics
+		log.G(h.Ctx).Info(fmt.Sprintf("\u2705 [POD FLOW] Pod specs: %+v", data.Pod))
+
 		annotations := make([]string, 0, len(data.Pod.Annotations))
 		for key, value := range data.Pod.Annotations {
 			annotations = append(annotations, key+"="+value)
-
-			// if the key is interlink.eu/pod-ip and the value is not empty, set the pod IP to the DIND container
-			if key == "interlink.eu/pod-ip" && value != "" {
-				podIpAddress = value
-			}
 		}
 		log.G(h.Ctx).Info("\u2705 [POD FLOW] Pod Annotations are: " + strings.Join(annotations, ", "))
-
-		log.G(h.Ctx).Info("\u2705 [POD FLOW] Pod IP Address is: " + podIpAddress)
-
-		// if podIpAddress is != "" then exec the command docker network connect vk0 --ip podIpAddress <container_name>
-		if podIpAddress != "" {
-			shell := exec.ExecTask{
-				Command: "docker",
-				Args:    []string{"network", "connect", "vk0", "--ip", podIpAddress, dindContainerID},
-				Shell:   true,
-			}
-
-			_, err = shell.Execute()
-			if err != nil {
-				HandleErrorAndRemoveData(h, w, "An error occurred during the connection of the DIND container to the vk0 network", err, "", "")
-				return
-			}
-
-			routeIP := strings.Split(podIpAddress, ".")
-			routeIP[3] = "251"
-			route := strings.Join(routeIP, ".")
-
-			log.G(h.Ctx).Info("\u2705 [POD FLOW] Route IP is: " + route)
-
-			// inside the dind container, add the route to the pod IP ip route add 10.0.0.0/8  via 10.244.12.251
-			shell = exec.ExecTask{
-				Command: "docker",
-				Args:    []string{"exec", dindContainerID, "ip", "route", "add", "10.0.0.0/8", "via", route},
-				Shell:   true,
-			}
-
-			_, err = shell.Execute()
-			if err != nil {
-				HandleErrorAndRemoveData(h, w, "An error occurred during the addition of the route to the pod IP", err, "", "")
-				return
-			}
-
-		}
 
 		// if the podDirectoryPath does not exist, create it
 		if _, err := os.Stat(podDirectoryPath); os.IsNotExist(err) {
@@ -412,7 +379,7 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// call prepareDockerRuns to get the DockerRunStruct array
-		dockerRunStructs, err := h.prepareDockerRuns(data, w, podIpAddress)
+		dockerRunStructs, err := h.prepareDockerRuns(data, w)
 		if err != nil {
 			HandleErrorAndRemoveData(h, w, "An error occurred during preparing of docker run commmands", err, "", "")
 			return
@@ -543,11 +510,6 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 
 			// create a file called containers_command.sh and write the containers commands to it, use WriteFile function
 			containersCommand := "#!/bin/sh\n"
-
-			// if podIpAddress is != "" , add the echo "nameserver 10.0 " > /etc/resolv.conf command to the containers_command.sh
-			if podIpAddress != "" {
-				containersCommand += "echo 'nameserver 10.96.0.10' > /etc/resolv.conf" + "\n"
-			}
 
 			for _, container := range containers {
 				containersCommand += container.Command + "\n"
