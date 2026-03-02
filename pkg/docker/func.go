@@ -3,27 +3,130 @@ package docker
 import (
 	"context"
 	"errors"
+	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	exec2 "github.com/alexellis/go-execute/pkg/v1"
 	"github.com/containerd/containerd/log"
+	"go.opentelemetry.io/otel/attribute"
+	trace "go.opentelemetry.io/otel/trace"
+	"gopkg.in/yaml.v2"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes"
 
-	commonIL "github.com/intertwin-eu/interlink-docker-plugin/pkg/common"
+	commonIL "github.com/interlink-hq/interlink/pkg/interlink"
 	"github.com/intertwin-eu/interlink-docker-plugin/pkg/docker/dindmanager"
 	"github.com/intertwin-eu/interlink-docker-plugin/pkg/docker/fpgastrategies"
 )
 
-type SidecarHandler struct {
-	Config      commonIL.InterLinkConfig
-	Ctx         context.Context
-	DindManager dindmanager.DindManagerInterface
-	FPGAManager fpgastrategies.FPGAManagerInterface
+var InterLinkConfigInst DockerConfig
+var Clientset *kubernetes.Clientset
+
+// TODO: implement factory design
+
+// NewInterLinkConfig returns a variable of type InterLinkConfig, used in many other functions and the first encountered error.
+func NewInterLinkConfig() (DockerConfig, error) {
+	if !InterLinkConfigInst.set {
+		var path string
+		verbose := flag.Bool("verbose", false, "Enable or disable Debug level logging")
+		errorsOnly := flag.Bool("errorsonly", false, "Prints only errors if enabled")
+		InterLinkConfigPath := flag.String("interlinkconfigpath", "", "Path to InterLink config")
+		flag.Parse()
+
+		if *verbose {
+			InterLinkConfigInst.VerboseLogging = true
+			InterLinkConfigInst.ErrorsOnlyLogging = false
+		} else if *errorsOnly {
+			InterLinkConfigInst.VerboseLogging = false
+			InterLinkConfigInst.ErrorsOnlyLogging = true
+		}
+
+		if *InterLinkConfigPath != "" {
+			path = *InterLinkConfigPath
+		} else if os.Getenv("INTERLINKCONFIGPATH") != "" {
+			path = os.Getenv("INTERLINKCONFIGPATH")
+		} else {
+			path = "/etc/interlink/InterLinkConfig.yaml"
+		}
+
+		if _, err := os.Stat(path); err != nil {
+			log.G(context.Background()).Error("File " + path + " doesn't exist. You can set a custom path by exporting INTERLINKCONFIGPATH. Exiting...")
+			return DockerConfig{}, err
+		}
+
+		log.G(context.Background()).Info("\u2705 Loading InterLink config from " + path)
+		yfile, err := os.ReadFile(path)
+		if err != nil {
+			log.G(context.Background()).Error("\u274C Error opening config file, exiting...")
+			return DockerConfig{}, err
+		}
+		yaml.Unmarshal(yfile, &InterLinkConfigInst)
+
+		if os.Getenv("TSOCKS") != "" {
+			if os.Getenv("TSOCKS") != "true" && os.Getenv("TSOCKS") != "false" {
+				fmt.Println("export TSOCKS as true or false")
+				return DockerConfig{}, err
+			}
+			if os.Getenv("TSOCKS") == "true" {
+				InterLinkConfigInst.Tsocks = true
+			} else {
+				InterLinkConfigInst.Tsocks = false
+			}
+		}
+
+		if os.Getenv("TSOCKSPATH") != "" {
+			path = os.Getenv("TSOCKSPATH")
+			if _, err := os.Stat(path); err != nil {
+				log.G(context.Background()).Error("File " + path + " doesn't exist. You can set a custom path by exporting TSOCKSPATH. Exiting...")
+				return DockerConfig{}, err
+			}
+
+			InterLinkConfigInst.Tsockspath = path
+		}
+
+		InterLinkConfigInst.set = true
+	}
+	return InterLinkConfigInst, nil
 }
 
-func parseContainerCommandAndReturnArgs(Ctx context.Context, config commonIL.InterLinkConfig, podUID string, podNamespace string, container v1.Container) ([]string, []string, []string, error) {
+func WithHTTPReturnCode(code int) SpanOption {
+	return func(cfg *SpanConfig) {
+		cfg.HTTPReturnCode = code
+		cfg.SetHTTPCode = true
+	}
+}
+
+func SetDurationSpan(startTime int64, span trace.Span, opts ...SpanOption) {
+	endTime := time.Now().UnixMicro()
+	config := &SpanConfig{}
+
+	for _, opt := range opts {
+		opt(config)
+	}
+
+	duration := endTime - startTime
+	span.SetAttributes(attribute.Int64("end.timestamp", endTime),
+		attribute.Int64("duration", duration))
+
+	if config.SetHTTPCode {
+		span.SetAttributes(attribute.Int("exit.code", config.HTTPReturnCode))
+	}
+}
+
+type SidecarHandler struct {
+	Config             DockerConfig
+	Ctx                context.Context
+	DindManager        dindmanager.DindManagerInterface
+	FPGAManager        fpgastrategies.FPGAManagerInterface
+	FinalDNSNameserver string
+	FinalDNSSearch     string
+}
+
+func parseContainerCommandAndReturnArgs(Ctx context.Context, config DockerConfig, podUID string, podNamespace string, container v1.Container) ([]string, []string, []string, error) {
 
 	dirPath := config.DataRootFolder + podNamespace + "-" + podUID
 	if _, err := os.Stat(dirPath); os.IsNotExist(err) {
@@ -83,7 +186,7 @@ func parseContainerCommandAndReturnArgs(Ctx context.Context, config commonIL.Int
 	}
 }
 
-func prepareMounts(Ctx context.Context, config commonIL.InterLinkConfig, data commonIL.RetrievedPodData, container v1.Container) (string, error) {
+func prepareMounts(Ctx context.Context, config DockerConfig, data commonIL.RetrievedPodData, container v1.Container) (string, error) {
 	mountedData := ""
 
 	podUID := string(data.Pod.UID)
@@ -94,7 +197,7 @@ func prepareMounts(Ctx context.Context, config commonIL.InterLinkConfig, data co
 		return "", err
 	}
 
-	allContainers := append(data.Containers, data.InitContainers...)
+	allContainers := append(data.Containers)
 
 	for _, cont := range allContainers {
 
@@ -148,7 +251,7 @@ func prepareMounts(Ctx context.Context, config commonIL.InterLinkConfig, data co
 	return mountedData, nil
 }
 
-func mountData(Ctx context.Context, config commonIL.InterLinkConfig, pod v1.Pod, data interface{}, container v1.Container) ([]string, error) {
+func mountData(Ctx context.Context, config DockerConfig, pod v1.Pod, data interface{}, container v1.Container) ([]string, error) {
 	wd, err := os.Getwd()
 	if err != nil {
 		log.G(Ctx).Error(err)
