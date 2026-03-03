@@ -6,6 +6,27 @@ import (
 	v1 "k8s.io/api/core/v1"
 )
 
+type DockerConfig struct {
+	VKConfigPath              string   `yaml:"VKConfigPath"`
+	Socket                    string   `yaml:"Socket"`
+	ExportPodData             bool     `yaml:"ExportPodData"`
+	Commandprefix             string   `yaml:"CommandPrefix"`
+	ImagePrefix               string   `yaml:"ImagePrefix"`
+	DataRootFolder            string   `yaml:"DataRootFolder"`
+	Namespace                 string   `yaml:"Namespace"`
+	Tsocks                    bool     `yaml:"Tsocks"`
+	Tsockspath                string   `yaml:"TsocksPath"`
+	Tsockslogin               string   `yaml:"TsocksLoginNode"`
+	BashPath                  string   `yaml:"BashPath"`
+	VerboseLogging            bool     `yaml:"VerboseLogging"`
+	ErrorsOnlyLogging         bool     `yaml:"ErrorsOnlyLogging"`
+	SingularityDefaultOptions []string `yaml:"SingularityDefaultOptions"`
+	SingularityPrefix         string   `yaml:"SingularityPrefix"`
+	SingularityPath           string   `yaml:"SingularityPath"`
+	EnableProbes              bool     `yaml:"EnableProbes"`
+	set                       bool
+}
+
 // PodCreateRequests is a struct holding data for a create request. Retrieved ConfigMaps and Secrets are held along the Pod description itself.
 type PodCreateRequests struct {
 	Pod        v1.Pod         `json:"pod"`
@@ -29,14 +50,6 @@ type RetrievedContainer struct {
 	ConfigMaps []v1.ConfigMap `json:"configMaps"`
 	Secrets    []v1.Secret    `json:"secrets"`
 	EmptyDirs  []string       `json:"emptyDirs"`
-}
-
-// RetrievedPoData is used in InterLink to rearrange data structure in a suitable way for the sidecar
-type RetrievedPodData struct {
-	Pod            v1.Pod               `json:"pod"`
-	Containers     []RetrievedContainer `json:"container"`
-	InitContainers []RetrievedContainer `json:"initContainer"`
-	JobScript      string               `json:"jobScript"`
 }
 
 // InterLinkConfig holds the whole configuration

@@ -10,7 +10,7 @@ import (
 
 	exec "github.com/alexellis/go-execute/pkg/v1"
 	"github.com/containerd/containerd/log"
-	commonIL "github.com/intertwin-eu/interlink-docker-plugin/pkg/common"
+	commonIL "github.com/interlink-hq/interlink/pkg/interlink"
 	"github.com/intertwin-eu/interlink-docker-plugin/pkg/docker/dindmanager"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"

@@ -2,6 +2,7 @@ package docker
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -15,7 +16,7 @@ import (
 
 	"errors"
 
-	commonIL "github.com/intertwin-eu/interlink-docker-plugin/pkg/common"
+	commonIL "github.com/interlink-hq/interlink/pkg/interlink"
 	"github.com/intertwin-eu/interlink-docker-plugin/pkg/docker/dindmanager"
 
 	"path/filepath"
@@ -25,7 +26,7 @@ import (
 	trace "go.opentelemetry.io/otel/trace"
 )
 
-func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w http.ResponseWriter, podIp string) ([]DockerRunStruct, error) {
+func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w http.ResponseWriter) ([]DockerRunStruct, error) {
 
 	var dockerRunStructs []DockerRunStruct
 	var gpuArgs string = ""
@@ -216,22 +217,6 @@ func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w 
 				cmd = append(cmd, fpgaArgs)
 			}
 
-			cmd = append(cmd, "-p", "8888:8888")
-
-			// if podIp != "" {
-			// 	// add --ip flag to the docker run command
-			// 	cmd = append(cmd, "--ip", podIp)
-
-			// 	// add --net vk0
-			// 	cmd = append(cmd, "--net", "vk0")
-
-			// 	// --dns 10.96.0.10
-			// 	cmd = append(cmd, "--dns", "10.96.0.10")
-
-			// 	// add NET_ADMIN  capability
-			// 	cmd = append(cmd, "--cap-add", "NET_ADMIN")
-			// }
-
 			var additionalPortArgs []string
 
 			for _, port := range container.Ports {
@@ -358,7 +343,7 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req []commonIL.RetrievedPodData
+	var req commonIL.RetrievedPodData
 	err = json.Unmarshal(bodyBytes, &req)
 
 	if err != nil {
@@ -374,79 +359,24 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.G(h.Ctx).Info("\u2705 [POD FLOW] Request data unmarshalled successfully and current working directory detected")
 
-	for _, data := range req {
+	var newReq []commonIL.RetrievedPodData
+	newReq = []commonIL.RetrievedPodData{req}
+
+	for _, data := range newReq {
 
 		podUID := string(data.Pod.UID)
 		podNamespace := string(data.Pod.Namespace)
 
 		podDirectoryPath := filepath.Join(wd, h.Config.DataRootFolder+"/"+podNamespace+"-"+podUID)
 
-		podIpAddress := ""
+		// log the pod specifics
+		log.G(h.Ctx).Info(fmt.Sprintf("\u2705 [POD FLOW] Pod specs: %+v", data.Pod))
+
 		annotations := make([]string, 0, len(data.Pod.Annotations))
 		for key, value := range data.Pod.Annotations {
 			annotations = append(annotations, key+"="+value)
-
-			// if the key is interlink.eu/pod-ip and the value is not empty, set the pod IP to the DIND container
-			if key == "interlink.eu/pod-ip" && value != "" {
-				podIpAddress = value
-			}
 		}
 		log.G(h.Ctx).Info("\u2705 [POD FLOW] Pod Annotations are: " + strings.Join(annotations, ", "))
-
-		log.G(h.Ctx).Info("\u2705 [POD FLOW] Pod IP Address is: " + podIpAddress)
-
-		// if podIpAddress is != "" then exec the command docker network connect vk0 --ip podIpAddress <container_name>
-		if podIpAddress != "" {
-			shell := exec.ExecTask{
-				Command: "docker",
-				Args:    []string{"network", "connect", "vk0", "--ip", podIpAddress, dindContainerID},
-				Shell:   true,
-			}
-
-			_, err = shell.Execute()
-			if err != nil {
-				HandleErrorAndRemoveData(h, w, "An error occurred during the connection of the DIND container to the vk0 network", err, "", "")
-				return
-			}
-
-			routeIP := strings.Split(podIpAddress, ".")
-			routeIP[3] = "251"
-			route := strings.Join(routeIP, ".")
-
-			log.G(h.Ctx).Info("\u2705 [POD FLOW] Route IP is: " + route)
-
-			// inside the dind container, add the route to the pod IP ip route add 10.0.0.0/8  via 10.244.12.251
-			shell = exec.ExecTask{
-				Command: "docker",
-				Args:    []string{"exec", dindContainerID, "ip", "route", "add", "10.0.0.0/8", "via", route},
-				Shell:   true,
-			}
-
-			_, err = shell.Execute()
-			if err != nil {
-				HandleErrorAndRemoveData(h, w, "An error occurred during the addition of the route to the pod IP", err, "", "")
-				return
-			}
-
-			// exec the command echo "nameserver 10.96.0.10" > /etc/resolv.conf
-			// shell = exec.ExecTask{
-			// 	Command: "docker",
-			// 	Args:    []string{"exec", dindContainerID, "-u", "0", "sh", "-c", "echo 'nameserver 10.96.0.10' > /etc/resolv.conf"},
-			// 	Shell:   true,
-			// }
-
-			// log.G(h.Ctx).Info("\u2705 [POD FLOW] Executing command to add nameserver to resolv.conf file")
-			// log.G(h.Ctx).Info("\u2705 [POD FLOW] Command: " + "docker " + strings.Join(shell.Args, " "))
-
-			// _, err = shell.Execute()
-			// if err != nil {
-			// 	HandleErrorAndRemoveData(h, w, "An error occurred during the addition of the nameserver to the resolv.conf file", err, "", "")
-			// 	return
-			// }
-
-			// log.G(h.Ctx).Info("\u2705 [POD FLOW] Nameserver added to resolv.conf file")
-
-		}
 
 		// if the podDirectoryPath does not exist, create it
 		if _, err := os.Stat(podDirectoryPath); os.IsNotExist(err) {
@@ -458,10 +388,128 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// call prepareDockerRuns to get the DockerRunStruct array
-		dockerRunStructs, err := h.prepareDockerRuns(data, w, podIpAddress)
+		dockerRunStructs, err := h.prepareDockerRuns(data, w)
 		if err != nil {
 			HandleErrorAndRemoveData(h, w, "An error occurred during preparing of docker run commmands", err, "", "")
 			return
+		}
+
+		if preExecAnnotations, ok := data.Pod.Annotations["slurm-job.vk.io/pre-exec"]; ok {
+			if strings.Contains(preExecAnnotations, "cat <<'EOFMESH' > $TMPDIR/mesh.sh") {
+				meshScript, err := extractHeredoc(preExecAnnotations, "EOFMESH")
+				if err == nil && meshScript != "" {
+					log.G(h.Ctx).Info("✅ [POD FLOW] Mesh.sh script extracted from annotation")
+
+					// Extract the binary download section (before EOFSLIRP)
+					downloadSection := extractDownloadSection(meshScript)
+
+					// Extract the WG_IFACE variable definition from outer script
+					wgIfaceDefinition := extractWGIfaceDefinition(meshScript)
+
+					// Extract the WireGuard config section
+					wgConfigSection := extractWGConfigSection(meshScript)
+
+					// Extract just the inner script (EOFSLIRP content)
+					innerScript, err := extractHeredoc(meshScript, "EOFSLIRP")
+					if err == nil && innerScript != "" {
+						finalDNSNameserver, finalDNSSearch := extractFinalDNSConfig(innerScript)
+
+						// Store these for DIND configuration
+						h.FinalDNSNameserver = finalDNSNameserver
+						h.FinalDNSSearch = finalDNSSearch
+
+						// Clean the header from inner script (remove duplicate shebang, set commands, etc.)
+						innerScript = cleanInnerScriptHeader(innerScript)
+
+						// Remove the final DNS config from inner script (we'll apply it to DIND)
+						innerScript = removeFinalDNSConfig(innerScript)
+
+						// Remove WG_IFACE definition from inner script (it's already extracted)
+						innerScript = removeWGIfaceDefinition(innerScript)
+
+						// Remove the slirp4netns execution at the end of inner script
+						innerScript = removeSlirp4netnsExecution(innerScript)
+
+						// Replace command execution with sleep infinity
+						innerScript = strings.Replace(innerScript, "$@", "sleep infinity", -1)
+
+						// Build the complete script with correct order
+						meshScript = `#!/bin/bash
+set -e
+set -m
+
+export PATH=$PATH:$PWD:/usr/sbin:/sbin
+
+# Set up temporary directory
+TMPDIR=${SLIRP_TMPDIR:-/tmp/.slirp.$RANDOM$RANDOM}
+mkdir -p $TMPDIR
+cd $TMPDIR
+
+` + downloadSection + `
+
+` + wgIfaceDefinition + `
+
+` + wgConfigSection + `
+
+` + innerScript
+					} else {
+						// Fallback: just clean up the outer script
+						meshScript = removeSlirp4netnsDownload(meshScript)
+						meshScript = removeUnshareWrapper(meshScript)
+						meshScript = strings.Replace(meshScript, "$@", "sleep infinity", -1)
+						meshScript = removeSlirp4netnsExecution(meshScript)
+					}
+
+					log.G(h.Ctx).Info("✅ [POD FLOW] Mesh.sh script cleaned and simplified")
+
+					// Create a special network overlay container name
+					networkContainerName := podNamespace + "-" + podUID + "-network-overlay"
+
+					// Save the modified mesh script to the pod directory
+					meshScriptPath := filepath.Join(podDirectoryPath, "mesh.sh")
+					err = os.WriteFile(meshScriptPath, []byte(meshScript), 0755)
+					if err != nil {
+						HandleErrorAndRemoveData(h, w, "An error occurred during the creation of mesh.sh script", err, podNamespace, podUID)
+						return
+					}
+
+					log.G(h.Ctx).Info("✅ [POD FLOW] Mesh.sh script saved to " + meshScriptPath)
+
+					// Prepare docker run command for the network overlay container
+					networkCmd := []string{
+						"run",
+						"--user", "root",
+						"-d",
+						"--name", networkContainerName,
+						"--privileged",
+						"--cap-add", "NET_ADMIN",
+						"--cap-add", "SYS_ADMIN",
+						"--cap-add", "NET_RAW",
+						"-v", meshScriptPath + ":/mesh.sh:ro",
+						"-v", podDirectoryPath + ":" + podDirectoryPath,
+						"-v", "/tmp:/tmp",
+						"--network", "host",
+						"nicolaka/netshoot",
+						"/bin/bash", "/mesh.sh",
+					}
+
+					// Prepend this as the first init container
+					dockerRunStructs = append([]DockerRunStruct{{
+						Name:            networkContainerName,
+						Command:         "docker " + strings.Join(networkCmd, " "),
+						IsInitContainer: false,
+						FpgaArgs:        "",
+					}}, dockerRunStructs...)
+
+					log.G(h.Ctx).Info("✅ [POD FLOW] Network overlay container prepared: " + networkContainerName)
+				} else {
+					log.G(h.Ctx).Error("❌ [POD FLOW] Failed to extract mesh.sh script from annotation")
+					if err != nil {
+						HandleErrorAndRemoveData(h, w, "Failed to extract mesh.sh heredoc", err, podNamespace, podUID)
+						return
+					}
+				}
+			}
 		}
 
 		log.G(h.Ctx).Info("\u2705 [POD FLOW] Docker run commands prepared successfully")
@@ -497,6 +545,64 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			HandleErrorAndRemoveData(h, w, "An error occurred during the rename of the DIND container", err, "", "")
 			return
+		}
+
+		isMeshScriptPresent := false
+
+		// Configure DNS on the DIND container if mesh script is present
+		if preExecAnnotations, ok := data.Pod.Annotations["slurm-job.vk.io/pre-exec"]; ok {
+			if strings.Contains(preExecAnnotations, "cat <<'EOFMESH'") {
+				log.G(h.Ctx).Info("✅ [POD FLOW] Configuring DNS on DIND container for cluster connectivity")
+
+				isMeshScriptPresent = true
+
+				// Use the extracted final DNS configuration
+				dnsNameserver := h.FinalDNSNameserver
+				dnsSearch := h.FinalDNSSearch
+
+				if dnsNameserver == "" {
+					dnsNameserver = "10.96.0.10" // Fallback
+				}
+				if dnsSearch == "" {
+					dnsSearch = "default.svc.cluster.local svc.cluster.local cluster.local" // Fallback
+				}
+
+				// Create DNS configuration script for DIND
+				dnsConfigScript := `#!/bin/sh
+set -e
+
+# Backup original resolv.conf
+cp /etc/resolv.conf /etc/resolv.conf.backup 2>/dev/null || true
+
+# Create new resolv.conf with cluster DNS
+cat > /etc/resolv.conf << EOF
+nameserver 8.8.8.8 
+search ` + dnsSearch + `
+EOF
+
+echo "DNS configured for cluster connectivity"
+`
+
+				// Write DNS config script to pod directory
+				dnsScriptPath := filepath.Join(podDirectoryPath, "configure-dns.sh")
+				err = os.WriteFile(dnsScriptPath, []byte(dnsConfigScript), 0755)
+				if err != nil {
+					log.G(h.Ctx).Warning("⚠️  Failed to create DNS config script: " + err.Error())
+				} else {
+					// Execute DNS configuration on DIND container
+					dnsExecCmd := exec.ExecTask{
+						Command: "docker",
+						Args:    []string{"exec", string(data.Pod.UID) + "_dind", "sh", dnsScriptPath},
+						Shell:   true,
+					}
+					_, err = dnsExecCmd.Execute()
+					if err != nil {
+						log.G(h.Ctx).Warning("⚠️  Failed to configure DNS on DIND container: " + err.Error())
+					} else {
+						log.G(h.Ctx).Info("✅ [POD FLOW] DNS configured on DIND container successfully with NS: " + dnsNameserver + ", Search: " + dnsSearch)
+					}
+				}
+			}
 		}
 
 		createResponse := CreateStruct{PodUID: string(data.Pod.UID), PodJID: dindContainerID}
@@ -585,19 +691,53 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 				log.G(h.Ctx).Info("\u2705 [POD FLOW] All init containers created and executed successfully")
 			}
 
+			log.G(h.Ctx).Info("\u2705 [POD FLOW] Start creating containers")
+
 			// create a file called containers_command.sh and write the containers commands to it, use WriteFile function
 			containersCommand := "#!/bin/sh\n"
 
-			// if podIpAddress is != "" , add the echo "nameserver 10.0 " > /etc/resolv.conf command to the containers_command.sh
-			if podIpAddress != "" {
-				containersCommand += "echo 'nameserver 10.96.0.10' > /etc/resolv.conf" + "\n"
+			if isMeshScriptPresent {
+
+				dnsNameserver := h.FinalDNSNameserver
+				dnsSearch := h.FinalDNSSearch
+
+				if dnsNameserver == "" {
+					dnsNameserver = "10.96.0.10" // Fallback
+				}
+				if dnsSearch == "" {
+					dnsSearch = "default.svc.cluster.local svc.cluster.local cluster.local" // Fallback
+				}
+
+				// Add a delay to ensure network container is ready
+				containersCommand += "echo 'Waiting for network overlay to be ready...'\n"
+				containersCommand += "sleep 10\n"
+				containersCommand += "echo 'Starting containers...'\n\n"
+
+				for _, container := range containers {
+					containersCommand += "# Start container: " + container.Name + "\n"
+					containersCommand += container.Command + "\n"
+					containersCommand += "sleep 2\n"
+
+					// Configure DNS inside the container
+					containersCommand += "# Configure DNS for container: " + container.Name + "\n"
+					containersCommand += "docker exec " + container.Name + " sh -c '\n"
+					containersCommand += "cp /etc/resolv.conf /etc/resolv.conf.backup 2>/dev/null || true\n"
+					containersCommand += "cat > /etc/resolv.conf << EOF\n"
+					containersCommand += "nameserver " + dnsNameserver + "\n"
+					containersCommand += "search " + dnsSearch + "\n"
+					containersCommand += "EOF\n"
+					containersCommand += "' || echo 'Warning: Could not configure DNS for " + container.Name + "'\n"
+					containersCommand += "echo 'DNS configured for container: " + container.Name + "'\n\n"
+				}
 			}
 
 			for _, container := range containers {
 				containersCommand += container.Command + "\n"
+				containersCommand += "sleep 30\n"
 			}
 			err = os.WriteFile(podDirectoryPath+"/containers_command.sh", []byte(containersCommand), 0644)
 			if err != nil {
+				log.G(h.Ctx).Error("\u274C [POD FLOW] Error writing containers command script: " + err.Error())
 				HandleErrorAndRemoveData(h, w, "An error occurred during the creation of the container commands script.", err, "", "")
 				return
 			}
@@ -609,8 +749,11 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 				Args:    []string{"exec", string(data.Pod.UID) + "_dind", "/bin/sh", podDirectoryPath + "/containers_command.sh"},
 			}
 
+			log.G(h.Ctx).Info("\u2705 [POD FLOW] Executing containers creation script inside DIND container; command to execute: docker " + strings.Join(shell.Args, " "))
+
 			_, err = shell.Execute()
 			if err != nil {
+				log.G(h.Ctx).Error("\u274C [POD FLOW] Error executing containers command script: " + err.Error())
 				HandleErrorAndRemoveData(h, w, "An error occurred during the execution of the container command script", err, "", "")
 				return
 			}

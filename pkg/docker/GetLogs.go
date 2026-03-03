@@ -14,7 +14,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	trace "go.opentelemetry.io/otel/trace"
 
-	commonIL "github.com/intertwin-eu/interlink-docker-plugin/pkg/common"
+	commonIL "github.com/interlink-hq/interlink/pkg/interlink"
 )
 
 func handleError(span trace.Span, err error, statusCode int, start int64) {

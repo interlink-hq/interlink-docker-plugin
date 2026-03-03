@@ -18,7 +18,6 @@ import (
 	//"github.com/containerd/log"
 	"github.com/containerd/log"
 	"github.com/google/uuid"
-	commonIL "github.com/intertwin-eu/interlink-docker-plugin/pkg/common"
 	docker "github.com/intertwin-eu/interlink-docker-plugin/pkg/docker"
 	"github.com/intertwin-eu/interlink-docker-plugin/pkg/docker/dindmanager"
 	"github.com/intertwin-eu/interlink-docker-plugin/pkg/docker/fpgastrategies"
@@ -159,7 +158,7 @@ func initProvider(ctx context.Context) (func(context.Context) error, error) {
 func main() {
 	logger := logrus.StandardLogger()
 
-	interLinkConfig, err := commonIL.NewInterLinkConfig()
+	interLinkConfig, err := docker.NewInterLinkConfig()
 	if err != nil {
 		log.G(context.Background()).Fatal(err)
 	}

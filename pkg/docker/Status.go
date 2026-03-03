@@ -15,7 +15,7 @@ import (
 	trace "go.opentelemetry.io/otel/trace"
 	v1 "k8s.io/api/core/v1"
 
-	commonIL "github.com/intertwin-eu/interlink-docker-plugin/pkg/common"
+	commonIL "github.com/interlink-hq/interlink/pkg/interlink"
 )
 
 // StatusHandler checks Docker Container's status by running docker ps -af command and returns that status
