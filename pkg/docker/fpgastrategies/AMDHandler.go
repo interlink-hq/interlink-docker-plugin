@@ -34,6 +34,8 @@ type FPGAManager struct {
 	FPGASpecsMutex sync.Mutex
 	Vendor         string
 	Ctx            context.Context
+	VitisPath      string
+	XRTPath        string
 }
 
 type FPGAManagerInterface interface {
@@ -52,17 +54,17 @@ type FPGAManagerInterface interface {
 func (a *FPGAManager) Init() error {
 
 	// Check if the Xilinx setup.sh file exists
-	if _, err := os.Stat("/opt/xilinx/xrt/setup.sh"); os.IsNotExist(err) {
-		return fmt.Errorf("/opt/xilinx/xrt/setup.sh does not exist: %v", err)
+	if _, err := os.Stat(a.XRTPath + "/setup.sh"); os.IsNotExist(err) {
+		return fmt.Errorf("%s/setup.sh does not exist: %v", a.XRTPath, err)
 	}
 
 	// Check if the path to Vitis exists
-	if _, err := os.Stat("/tools/Xilinx/Vitis/2023.2"); os.IsNotExist(err) {
-		return fmt.Errorf("/tools/Xilinx/Vitis/2023.2 does not exist: %v", err)
+	if _, err := os.Stat(a.VitisPath); os.IsNotExist(err) {
+		return fmt.Errorf("%s does not exist: %v", a.VitisPath, err)
 	}
 
 	// Source the setup.sh to initialize Xilinx tools using shell
-	shellArgs := []string{"source", "/opt/xilinx/xrt/setup.sh"}
+	shellArgs := []string{"source", a.XRTPath + "/setup.sh"}
 	shell := exec.ExecTask{
 		Command: "/bin/bash",
 		Args:    shellArgs,
@@ -105,7 +107,7 @@ func (a *FPGAManager) Discover() error {
 				continue
 			}
 			bdf := parts[0]
-			shellArgs := []string{"/opt/xilinx/xrt/setup.sh"}
+			shellArgs := []string{a.XRTPath + "/setup.sh"}
 			shell := exec.ExecTask{
 				Command: "source",
 				Args:    shellArgs,
@@ -118,7 +120,7 @@ func (a *FPGAManager) Discover() error {
 			}
 
 			cmd := exec.ExecTask{
-				Command: "/opt/xilinx/xrt/bin/xbutil",
+				Command: a.XRTPath + "/bin/xbutil",
 				Args:    []string{"examine"}, // "--device", bdf
 				Shell:   false,
 			}

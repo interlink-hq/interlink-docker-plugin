@@ -178,8 +178,10 @@ func main() {
 		availableDinds = "2"
 	}
 	var dindHandler dindmanager.DindManagerInterface = &dindmanager.DindManager{
-		DindList: []dindmanager.DindSpecs{},
-		Ctx:      ctx,
+		DindList:        []dindmanager.DindSpecs{},
+		Ctx:             ctx,
+		FPGAEnabled:     interLinkConfig.FPGAEnabled,
+		XilinxToolsPath: interLinkConfig.XilinxToolsPath,
 	}
 	availableDindsInt, err := strconv.ParseInt(availableDinds, 10, 8)
 	if err != nil {
@@ -214,10 +216,12 @@ func main() {
 		log.G(ctx).Info("\u2705 Tracing is disabled")
 	}
 
-	if os.Getenv("FPGAENABLED") == "1" {
+	if interLinkConfig.FPGAEnabled {
 		fpgaManager := &fpgastrategies.FPGAManager{
 			FPGASpecsList: []fpgastrategies.FPGASpecs{},
 			Ctx:           ctx,
+			VitisPath:     interLinkConfig.VitisPath,
+			XRTPath:       interLinkConfig.XRTPath,
 		}
 		err = fpgaManager.Init()
 		if err != nil {

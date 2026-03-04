@@ -34,8 +34,10 @@ type DindSpecs struct {
 }
 
 type DindManager struct {
-	DindList []DindSpecs
-	Ctx      context.Context
+	DindList        []DindSpecs
+	Ctx             context.Context
+	FPGAEnabled     bool
+	XilinxToolsPath string
 }
 
 // GenerateUUIDv4 generates a random UUIDv4
@@ -145,9 +147,9 @@ func (a *DindManager) BuildDindContainers(nDindContainer int8) error {
 			dindContainerArgs = append(dindContainerArgs, "-v", "/cvmfs:/cvmfs")
 		}
 
-		if os.Getenv("FPGAENABLED") == "1" {
-			if _, err := os.Stat("/tools/Xilinx/"); err == nil {
-				dindContainerArgs = append(dindContainerArgs, "-v", "/tools/Xilinx/:/tools/Xilinx/:ro")
+		if a.FPGAEnabled {
+			if _, err := os.Stat(a.XilinxToolsPath); err == nil {
+				dindContainerArgs = append(dindContainerArgs, "-v", a.XilinxToolsPath+":"+a.XilinxToolsPath+":ro")
 			}
 		}
 

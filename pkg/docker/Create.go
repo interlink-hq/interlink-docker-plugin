@@ -176,9 +176,9 @@ func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w 
 				}
 			}
 
-			// if FPGA is requested, mount in read mode the /tools/Xilinx/ path in the container
+			// if FPGA is requested, mount in read mode the Xilinx tools path in the container
 			if isFPGARequested {
-				envVars += " -v /tools/Xilinx/:/tools/Xilinx/:ro"
+				envVars += " -v " + h.Config.XilinxToolsPath + ":" + h.Config.XilinxToolsPath + ":ro"
 			}
 
 			log.G(h.Ctx).Info("\u2705 [POD FLOW] Before creating run command")

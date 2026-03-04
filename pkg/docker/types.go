@@ -25,6 +25,10 @@ type DockerConfig struct {
 	SingularityPrefix         string   `yaml:"SingularityPrefix"`
 	SingularityPath           string   `yaml:"SingularityPath"`
 	EnableProbes              bool     `yaml:"EnableProbes"`
+	FPGAEnabled               bool     `yaml:"FPGAEnabled"`
+	XilinxToolsPath           string   `yaml:"XilinxToolsPath"`
+	VitisPath                 string   `yaml:"VitisPath"`
+	XRTPath                   string   `yaml:"XRTPath"`
 	set                       bool
 }
 

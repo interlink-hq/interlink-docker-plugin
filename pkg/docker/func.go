@@ -88,6 +88,16 @@ func NewInterLinkConfig() (DockerConfig, error) {
 			InterLinkConfigInst.Tsockspath = path
 		}
 
+		if InterLinkConfigInst.XilinxToolsPath == "" {
+			InterLinkConfigInst.XilinxToolsPath = "/tools/Xilinx/"
+		}
+		if InterLinkConfigInst.VitisPath == "" {
+			InterLinkConfigInst.VitisPath = "/tools/Xilinx/Vitis/2023.2"
+		}
+		if InterLinkConfigInst.XRTPath == "" {
+			InterLinkConfigInst.XRTPath = "/opt/xilinx/xrt"
+		}
+
 		InterLinkConfigInst.set = true
 	}
 	return InterLinkConfigInst, nil
