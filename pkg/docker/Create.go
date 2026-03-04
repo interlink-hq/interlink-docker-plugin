@@ -196,29 +196,14 @@ func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w 
 				cmd = append(cmd, fpgaArgs)
 			}
 
-			cmd = append(cmd, "-p", "8888:8888")
-
-			// if podIp != "" {
-			// 	// add --ip flag to the docker run command
-			// 	cmd = append(cmd, "--ip", podIp)
-
-			// 	// add --net vk0
-			// 	cmd = append(cmd, "--net", "vk0")
-
-			// 	// --dns 10.96.0.10
-			// 	cmd = append(cmd, "--dns", "10.96.0.10")
-
-			// 	// add NET_ADMIN  capability
-			// 	cmd = append(cmd, "--cap-add", "NET_ADMIN")
-			// }
-
 			var additionalPortArgs []string
 
 			for _, port := range container.Ports {
-				if port.HostPort != 0 {
-					additionalPortArgs = append(additionalPortArgs, "-p", strconv.Itoa(int(port.HostPort))+":"+strconv.Itoa(int(port.ContainerPort)))
-				}
+				log.G(h.Ctx).Info("\u2705 [POD FLOW] Container port: " + strconv.Itoa(int(port.ContainerPort)) + " Protocol: " + string(port.Protocol) + " HostPort: " + strconv.Itoa(int(port.HostPort)))
+				additionalPortArgs = append(additionalPortArgs, "-p", strconv.Itoa(int(port.ContainerPort))+":"+strconv.Itoa(int(port.ContainerPort)))
 			}
+
+			log.G(h.Ctx).Info("\u2705 [POD FLOW] Additional port arguments for container " + containerName + ": " + strings.Join(additionalPortArgs, " "))
 
 			cmd = append(cmd, additionalPortArgs...)
 
@@ -363,6 +348,10 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 
 		podDirectoryPath := filepath.Join(wd, h.Config.DataRootFolder+"/"+podNamespace+"-"+podUID)
 
+		// Sentinel file written by mesh.sh once network setup is complete.
+		// containers_command.sh polls for this file before starting workload containers.
+		meshReadyFile := filepath.Join(podDirectoryPath, "mesh_ready")
+
 		// log the pod specifics
 		log.G(h.Ctx).Info(fmt.Sprintf("\u2705 [POD FLOW] Pod specs: %+v", data.Pod))
 
@@ -424,13 +413,16 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 						// Remove the slirp4netns execution at the end of inner script
 						innerScript = removeSlirp4netnsExecution(innerScript)
 
-						// Replace command execution with sleep infinity
-						innerScript = strings.Replace(innerScript, "$@", "sleep infinity", -1)
+						// Replace command execution with a sentinel touch followed by sleep infinity.
+						// The sentinel file signals to containers_command.sh that network setup is done.
+						innerScript = strings.Replace(innerScript, "$@", "touch "+meshReadyFile+" && sleep infinity", -1)
 
 						// Build the complete script with correct order
 						meshScript = `#!/bin/bash
 set -e
 set -m
+
+sleep 20s
 
 export PATH=$PATH:$PWD:/usr/sbin:/sbin
 
@@ -447,10 +439,10 @@ cd $TMPDIR
 
 ` + innerScript
 					} else {
-						// Fallback: just clean up the outer script
+						// Fallback: just clean up the outer script, still touch the sentinel before sleeping.
 						meshScript = removeSlirp4netnsDownload(meshScript)
 						meshScript = removeUnshareWrapper(meshScript)
-						meshScript = strings.Replace(meshScript, "$@", "sleep infinity", -1)
+						meshScript = strings.Replace(meshScript, "$@", "touch "+meshReadyFile+" && sleep infinity", -1)
 						meshScript = removeSlirp4netnsExecution(meshScript)
 					}
 
@@ -702,12 +694,23 @@ echo "DNS configured for cluster connectivity"
 					dnsSearch = "default.svc.cluster.local svc.cluster.local cluster.local" // Fallback
 				}
 
-				// Add a delay to ensure network container is ready
-				containersCommand += "echo 'Waiting for network overlay to be ready...'\n"
-				containersCommand += "sleep 10\n"
-				containersCommand += "echo 'Starting containers...'\n\n"
+				// The first container in the list is the network-overlay; start it immediately.
+				// All subsequent containers are workload containers and must wait for the sentinel.
+				networkOverlay := containers[0]
+				workloadContainers := containers[1:]
 
-				for _, container := range containers {
+				containersCommand += "# Start network overlay container first\n"
+				containersCommand += networkOverlay.Command + "\n\n"
+
+				// Poll for the sentinel file written by mesh.sh once network setup is complete.
+				containersCommand += "echo 'Waiting for network overlay to be ready...'\n"
+				containersCommand += "while [ ! -f " + meshReadyFile + " ]; do\n"
+				containersCommand += "  echo 'Network not ready yet, waiting 2s...'\n"
+				containersCommand += "  sleep 2\n"
+				containersCommand += "done\n"
+				containersCommand += "echo 'Network overlay is ready (sentinel file found), starting containers...'\n\n"
+
+				for _, container := range workloadContainers {
 					containersCommand += "# Start container: " + container.Name + "\n"
 					containersCommand += container.Command + "\n"
 					containersCommand += "sleep 2\n"
@@ -718,16 +721,17 @@ echo "DNS configured for cluster connectivity"
 					containersCommand += "cp /etc/resolv.conf /etc/resolv.conf.backup 2>/dev/null || true\n"
 					containersCommand += "cat > /etc/resolv.conf << EOF\n"
 					containersCommand += "nameserver " + dnsNameserver + "\n"
+					containersCommand += "nameserver 8.8.8.8 \n"
 					containersCommand += "search " + dnsSearch + "\n"
 					containersCommand += "EOF\n"
 					containersCommand += "' || echo 'Warning: Could not configure DNS for " + container.Name + "'\n"
 					containersCommand += "echo 'DNS configured for container: " + container.Name + "'\n\n"
 				}
-			}
-
-			for _, container := range containers {
-				containersCommand += container.Command + "\n"
-				containersCommand += "sleep 30\n"
+			} else {
+				for _, container := range containers {
+					containersCommand += container.Command + "\n"
+					containersCommand += "sleep 1\n"
+				}
 			}
 			err = os.WriteFile(podDirectoryPath+"/containers_command.sh", []byte(containersCommand), 0644)
 			if err != nil {
