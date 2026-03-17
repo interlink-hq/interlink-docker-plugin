@@ -29,6 +29,7 @@ type DockerConfig struct {
 	XilinxToolsPath           string   `yaml:"XilinxToolsPath"`
 	VitisPath                 string   `yaml:"VitisPath"`
 	XRTPath                   string   `yaml:"XRTPath"`
+	DockerNetworkSubnet       []string `yaml:"DockerNetworkSubnet"`
 	set                       bool
 }
 
@@ -71,31 +72,32 @@ type RetrievedContainer struct {
 
 // InterLinkConfig holds the whole configuration
 type InterLinkConfig struct {
-	VKConfigPath      string `yaml:"VKConfigPath"`
-	VKTokenFile       string `yaml:"VKTokenFile"`
-	Interlinkurl      string `yaml:"InterlinkURL"`
-	Sidecarurl        string `yaml:"SidecarURL"`
-	Sbatchpath        string `yaml:"SbatchPath"`
-	Scancelpath       string `yaml:"ScancelPath"`
-	Squeuepath        string `yaml:"SqueuePath"`
-	Interlinkport     string `yaml:"InterlinkPort"`
-	Socket            string `yaml:"Socket"`
-	Sidecarport       string `yaml:"SidecarPort"`
-	Commandprefix     string `yaml:"CommandPrefix"`
-	ExportPodData     bool   `yaml:"ExportPodData"`
-	DataRootFolder    string `yaml:"DataRootFolder"`
-	ServiceAccount    string `yaml:"ServiceAccount"`
-	Namespace         string `yaml:"Namespace"`
-	Tsocks            bool   `yaml:"Tsocks"`
-	Tsockspath        string `yaml:"TsocksPath"`
-	Tsocksconfig      string `yaml:"TsocksConfig"`
-	Tsockslogin       string `yaml:"TsocksLoginNode"`
-	BashPath          string `yaml:"BashPath"`
-	VerboseLogging    bool   `yaml:"VerboseLogging"`
-	ErrorsOnlyLogging bool   `yaml:"ErrorsOnlyLogging"`
-	PodIP             string `yaml:"PodIP"`
-	SingularityPrefix string `yaml:"SingularityPrefix"`
-	set               bool
+	VKConfigPath        string   `yaml:"VKConfigPath"`
+	VKTokenFile         string   `yaml:"VKTokenFile"`
+	Interlinkurl        string   `yaml:"InterlinkURL"`
+	Sidecarurl          string   `yaml:"SidecarURL"`
+	Sbatchpath          string   `yaml:"SbatchPath"`
+	Scancelpath         string   `yaml:"ScancelPath"`
+	Squeuepath          string   `yaml:"SqueuePath"`
+	Interlinkport       string   `yaml:"InterlinkPort"`
+	Socket              string   `yaml:"Socket"`
+	Sidecarport         string   `yaml:"SidecarPort"`
+	Commandprefix       string   `yaml:"CommandPrefix"`
+	ExportPodData       bool     `yaml:"ExportPodData"`
+	DataRootFolder      string   `yaml:"DataRootFolder"`
+	ServiceAccount      string   `yaml:"ServiceAccount"`
+	Namespace           string   `yaml:"Namespace"`
+	Tsocks              bool     `yaml:"Tsocks"`
+	Tsockspath          string   `yaml:"TsocksPath"`
+	Tsocksconfig        string   `yaml:"TsocksConfig"`
+	Tsockslogin         string   `yaml:"TsocksLoginNode"`
+	BashPath            string   `yaml:"BashPath"`
+	VerboseLogging      bool     `yaml:"VerboseLogging"`
+	ErrorsOnlyLogging   bool     `yaml:"ErrorsOnlyLogging"`
+	PodIP               string   `yaml:"PodIP"`
+	SingularityPrefix   string   `yaml:"SingularityPrefix"`
+	DockerNetworkSubnet []string `yaml:"DockerNetworkSubnet"`
+	set                 bool
 }
 
 // ContainerLogOpts is a struct in which it is possible to specify options to retrieve logs from the sidecar

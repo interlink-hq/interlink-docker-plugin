@@ -87,8 +87,34 @@ func (h *SidecarHandler) StatusHandler(w http.ResponseWriter, r *http.Request) {
 
 		resp = append(resp, commonIL.PodStatus{PodName: pod.Name, PodUID: podUID, PodNamespace: podNamespace, JobID: dindUUID})
 
+		disabledInitContainers := make(map[string]bool)
+		if ann, ok := pod.Annotations["interlink.eu/disable-offload-init-containers"]; ok {
+			for _, name := range strings.Split(ann, ",") {
+				name = strings.TrimSpace(name)
+				if name != "" {
+					disabledInitContainers[name] = true
+				}
+			}
+		}
+
 		// check if the pod has initContainers and get their status
 		for _, container := range pod.Spec.InitContainers {
+
+			if disabledInitContainers[container.Name] {
+				log.G(h.Ctx).Infof("✅ [STATUS CALL] init container %s is marked as non-offloaded, reporting as Completed", container.Name)
+				resp[i].InitContainers = append(resp[i].InitContainers, v1.ContainerStatus{
+					Name:  container.Name,
+					Ready: false,
+					State: v1.ContainerState{
+						Terminated: &v1.ContainerStateTerminated{
+							ExitCode: 0,
+							Reason:   "Completed",
+						},
+					},
+				})
+				continue
+			}
+
 			containerName := podNamespace + "-" + podUID + "-" + container.Name
 			cmd := []string{"exec " + podUID + "_dind" + " docker ps -af name=^" + containerName + "$ --format \"{{.Status}}\""}
 			shell := exec.ExecTask{
@@ -130,7 +156,29 @@ func (h *SidecarHandler) StatusHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		disabledContainers := make(map[string]bool)
+		if ann, ok := pod.Annotations["interlink.eu/disable-offload-containers"]; ok {
+			for _, name := range strings.Split(ann, ",") {
+				name = strings.TrimSpace(name)
+				if name != "" {
+					disabledContainers[name] = true
+				}
+			}
+		}
+
 		for _, container := range pod.Spec.Containers {
+
+			if disabledContainers[container.Name] {
+				log.G(h.Ctx).Infof("✅ [STATUS CALL] container %s is marked as non-offloaded, reporting as Running", container.Name)
+				resp[i].Containers = append(resp[i].Containers, v1.ContainerStatus{
+					Name:  container.Name,
+					Ready: true,
+					State: v1.ContainerState{
+						Running: &v1.ContainerStateRunning{},
+					},
+				})
+				continue
+			}
 
 			containerName := podNamespace + "-" + podUID + "-" + container.Name
 			cmd := []string{"exec " + podUID + "_dind" + " docker ps -af name=^" + containerName + "$ --format \"{{.Status}}\""}

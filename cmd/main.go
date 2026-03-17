@@ -162,6 +162,9 @@ func main() {
 		log.G(context.Background()).Fatal(err)
 	}
 
+	// log the interlinkconfig
+	log.G(context.Background()).Info("\u2705 InterLinkConfig: ", interLinkConfig)
+
 	if interLinkConfig.VerboseLogging {
 		logger.SetLevel(logrus.DebugLevel)
 	} else if interLinkConfig.ErrorsOnlyLogging {
@@ -177,16 +180,35 @@ func main() {
 	if availableDinds == "" {
 		availableDinds = "2"
 	}
+	availableDindsInt, err := strconv.ParseInt(availableDinds, 10, 8)
+	if err != nil {
+		log.G(ctx).Fatal("Error parsing AVAILABLEDINDS: ", err)
+	}
+
+	// Build the subnet pool from the config (empty slice = no pool).
+	subnetPool, err := dindmanager.InitSubnetPool(interLinkConfig.DockerNetworkSubnet)
+	if err != nil {
+		log.G(ctx).Fatal("Error initialising subnet pool: ", err)
+	}
+	if len(subnetPool) > 0 {
+		log.G(ctx).Info(fmt.Sprintf(
+			"\u2705 Subnet pool initialised: %d /24 subnets available from %v",
+			len(subnetPool), interLinkConfig.DockerNetworkSubnet,
+		))
+	} else {
+		log.G(ctx).Info("\u2705 No DockerNetworkSubnet configured — Docker will assign subnets automatically")
+	}
+
 	var dindHandler dindmanager.DindManagerInterface = &dindmanager.DindManager{
 		DindList:        []dindmanager.DindSpecs{},
 		Ctx:             ctx,
 		FPGAEnabled:     interLinkConfig.FPGAEnabled,
 		XilinxToolsPath: interLinkConfig.XilinxToolsPath,
+		SubnetPool:      subnetPool,
 	}
-	availableDindsInt, err := strconv.ParseInt(availableDinds, 10, 8)
-	if err != nil {
-		log.G(ctx).Info("\u2705 Error parsing availableDinds")
-	}
+
+	dindHandler.(*dindmanager.DindManager).InitialPoolSz = len(subnetPool)
+
 	dindHandler.CleanDindContainers()
 	dindHandler.BuildDindContainers(int8(availableDindsInt))
 

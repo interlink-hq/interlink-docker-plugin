@@ -554,40 +554,40 @@ cd $TMPDIR
 				}
 
 				// Create DNS configuration script for DIND
-				dnsConfigScript := `#!/bin/sh
-set -e
+				/* 				dnsConfigScript := `#!/bin/sh
+				set -e
 
-# Backup original resolv.conf
-cp /etc/resolv.conf /etc/resolv.conf.backup 2>/dev/null || true
+				# Backup original resolv.conf
+				cp /etc/resolv.conf /etc/resolv.conf.backup 2>/dev/null || true
 
-# Create new resolv.conf with cluster DNS
-cat > /etc/resolv.conf << EOF
-nameserver 8.8.8.8 
-search ` + dnsSearch + `
-EOF
+				# Create new resolv.conf with cluster DNS
+				cat > /etc/resolv.conf << EOF
+				nameserver 8.8.8.8
+				search ` + dnsSearch + `
+				EOF
 
-echo "DNS configured for cluster connectivity"
-`
+				echo "DNS configured for cluster connectivity"
+				`
 
-				// Write DNS config script to pod directory
-				dnsScriptPath := filepath.Join(podDirectoryPath, "configure-dns.sh")
-				err = os.WriteFile(dnsScriptPath, []byte(dnsConfigScript), 0755)
-				if err != nil {
-					log.G(h.Ctx).Warning("⚠️  Failed to create DNS config script: " + err.Error())
-				} else {
-					// Execute DNS configuration on DIND container
-					dnsExecCmd := exec.ExecTask{
-						Command: "docker",
-						Args:    []string{"exec", string(data.Pod.UID) + "_dind", "sh", dnsScriptPath},
-						Shell:   true,
-					}
-					_, err = dnsExecCmd.Execute()
-					if err != nil {
-						log.G(h.Ctx).Warning("⚠️  Failed to configure DNS on DIND container: " + err.Error())
-					} else {
-						log.G(h.Ctx).Info("✅ [POD FLOW] DNS configured on DIND container successfully with NS: " + dnsNameserver + ", Search: " + dnsSearch)
-					}
-				}
+								// Write DNS config script to pod directory
+								dnsScriptPath := filepath.Join(podDirectoryPath, "configure-dns.sh")
+								err = os.WriteFile(dnsScriptPath, []byte(dnsConfigScript), 0755)
+								if err != nil {
+									log.G(h.Ctx).Warning("⚠️  Failed to create DNS config script: " + err.Error())
+								} else {
+									// Execute DNS configuration on DIND container
+									dnsExecCmd := exec.ExecTask{
+										Command: "docker",
+										Args:    []string{"exec", string(data.Pod.UID) + "_dind", "sh", dnsScriptPath},
+										Shell:   true,
+									}
+									_, err = dnsExecCmd.Execute()
+									if err != nil {
+										log.G(h.Ctx).Warning("⚠️  Failed to configure DNS on DIND container: " + err.Error())
+									} else {
+										log.G(h.Ctx).Info("✅ [POD FLOW] DNS configured on DIND container successfully with NS: " + dnsNameserver + ", Search: " + dnsSearch)
+									}
+								} */
 			}
 		}
 
