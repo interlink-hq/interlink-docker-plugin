@@ -14,6 +14,7 @@ import (
 	"github.com/containerd/containerd/log"
 
 	OSexec "os/exec"
+	"sync/atomic"
 )
 
 type DindManagerInterface interface {
@@ -21,11 +22,13 @@ type DindManagerInterface interface {
 	BuildDindContainers(nDindContainer int8) error
 	PrintDindList() error
 	GetAvailableDind() (string, error)
+	ClaimAvailableDind(podUID string) (string, error)
 	SetDindUnavailable(dindID string) error
 	RemoveDindFromList(PodUID string) error
 	SetPodUIDToDind(dindID string, podUID string) error
 	GetDindFromPodUID(podUID string) (DindSpecs, error)
 	SetDindAvailable(PodUID string) error
+	ReapOrphanNetworks()
 }
 
 type DindSpecs struct {
@@ -47,6 +50,16 @@ type DindManager struct {
 	SubnetPool    []string
 	mu            sync.Mutex
 	InitialPoolSz int // total subnets at startup, used for logging
+
+	// listMu protects DindList. Kept separate from mu (which protects SubnetPool)
+	// so that RemoveDindFromList can hold listMu while calling freeSubnet (mu)
+	// without self-deadlock. Lock ordering is always listMu -> mu, never reverse.
+	listMu sync.Mutex
+
+	// buildsInFlight counts in-progress BuildDindContainers calls. The orphan
+	// network reaper checks it so it never removes a bridge network in the brief
+	// window after it is created but before its DIND container attaches to it.
+	buildsInFlight int32
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +210,11 @@ func (a *DindManager) CleanDindContainers() error {
 }
 
 func (a *DindManager) BuildDindContainers(nDindContainer int8) error {
+	// Signal to the reaper that a build is running: freshly created networks are
+	// briefly container-less and must not be reaped as "orphans".
+	atomic.AddInt32(&a.buildsInFlight, 1)
+	defer atomic.AddInt32(&a.buildsInFlight, -1)
+
 	log.G(a.Ctx).Info(fmt.Sprintf("\u2705 Creating %d DIND containers", nDindContainer))
 
 	// Log subnet pool status before we start allocating.
@@ -215,7 +233,7 @@ func (a *DindManager) BuildDindContainers(nDindContainer int8) error {
 	}
 
 	gpuEnabled := os.Getenv("GPUENABLED")
-	dindImage := "docker:dind"
+	dindImage := "docker:29.3.0-dind"
 	if gpuEnabled == "1" {
 		dindImage = "ghcr.io/extrality/nvidia-dind"
 	}
@@ -301,27 +319,45 @@ func (a *DindManager) BuildDindContainers(nDindContainer int8) error {
 		log.G(a.Ctx).Info(fmt.Sprintf("\u2705 Command is %s", shell.Command+" "+strings.Join(shell.Args, " ")))
 
 		execReturn, err := shell.Execute()
+		// go-execute returns a nil error for a non-zero exit, so the exit code has
+		// to be checked explicitly or a failed "docker run" is silently treated as
+		// a success (empty container ID, then a readiness timeout 20s later).
+		if err == nil && execReturn.ExitCode != 0 {
+			err = fmt.Errorf("docker run exited with code %d: %s",
+				execReturn.ExitCode, strings.TrimSpace(execReturn.Stderr))
+		}
 		if err != nil {
-			log.G(a.Ctx).Error(fmt.Sprintf("\u274c Error creating DIND container %s", randUID+"_dind"))
+			log.G(a.Ctx).Error(fmt.Sprintf("\u274c Error creating DIND container %s: %v", randUID+"_dind", err))
 			log.G(a.Ctx).Error(fmt.Sprintf("\u274c %s", execReturn.Stderr))
 			// Free the subnet so it can be reused.
 			a.freeSubnet(allocatedSubnet)
 			return err
 		}
-		dindContainerID := execReturn.Stdout
+		dindContainerID := strings.TrimSpace(execReturn.Stdout)
+		if dindContainerID == "" {
+			a.freeSubnet(allocatedSubnet)
+			return fmt.Errorf("docker run returned an empty container ID for %s (stderr: %s)",
+				randUID+"_dind", strings.TrimSpace(execReturn.Stderr))
+		}
 
 		// ----------------------------------------------------------------
 		// Wait for the daemon inside the DinD container to be ready.
 		// ----------------------------------------------------------------
 		maxRetries := 20
+		lastOutput := ""
 		for {
 			if maxRetries == 0 {
 				a.freeSubnet(allocatedSubnet)
+				// Surface what the daemon actually logged, otherwise the timeout
+				// is indistinguishable from a container that never started.
+				log.G(a.Ctx).Error(fmt.Sprintf("❌ Last output of \"docker logs %s\": %s",
+					randUID+"_dind", strings.TrimSpace(lastOutput)))
 				return fmt.Errorf("DIND container %s did not become ready in time", dindContainerID)
 			}
 
 			cmd := OSexec.Command("docker", "logs", randUID+"_dind")
 			output, err := cmd.CombinedOutput()
+			lastOutput = string(output)
 			if err == nil && strings.Contains(string(output), "API listen on /var/run/docker.sock") {
 				break
 			}
@@ -349,6 +385,7 @@ func (a *DindManager) BuildDindContainers(nDindContainer int8) error {
 		// ----------------------------------------------------------------
 		// Register the new DinD in the list.
 		// ----------------------------------------------------------------
+		a.listMu.Lock()
 		a.DindList = append(a.DindList, DindSpecs{
 			DindID:          randUID + "_dind",
 			PodUID:          "",
@@ -356,12 +393,15 @@ func (a *DindManager) BuildDindContainers(nDindContainer int8) error {
 			AllocatedSubnet: allocatedSubnet, // empty string when no pool
 			Available:       true,
 		})
+		a.listMu.Unlock()
 	}
 
 	return nil
 }
 
 func (a *DindManager) PrintDindList() error {
+	a.listMu.Lock()
+	defer a.listMu.Unlock()
 	for _, d := range a.DindList {
 		log.G(a.Ctx).Info(fmt.Sprintf(
 			"DindID: %s, PodUID: %s, DindNetworkID: %s, AllocatedSubnet: %q, Available: %t",
@@ -372,6 +412,8 @@ func (a *DindManager) PrintDindList() error {
 }
 
 func (a *DindManager) GetDindFromPodUID(podUID string) (DindSpecs, error) {
+	a.listMu.Lock()
+	defer a.listMu.Unlock()
 	for _, d := range a.DindList {
 		if d.PodUID == podUID {
 			return d, nil
@@ -381,6 +423,8 @@ func (a *DindManager) GetDindFromPodUID(podUID string) (DindSpecs, error) {
 }
 
 func (a *DindManager) GetAvailableDind() (string, error) {
+	a.listMu.Lock()
+	defer a.listMu.Unlock()
 	for _, d := range a.DindList {
 		if d.Available {
 			return d.DindID, nil
@@ -389,7 +433,28 @@ func (a *DindManager) GetAvailableDind() (string, error) {
 	return "", fmt.Errorf("no available DIND container")
 }
 
+// ClaimAvailableDind atomically finds an available DIND container, marks it
+// unavailable, and records the pod UID against it — all under a single lock.
+// Doing this in one step (instead of GetAvailableDind + SetDindUnavailable +
+// SetPodUIDToDind) prevents two concurrent creates from grabbing the same
+// container, and guarantees the DIND is findable by pod UID for cleanup the
+// moment it is claimed, closing the window where a failure would orphan it.
+func (a *DindManager) ClaimAvailableDind(podUID string) (string, error) {
+	a.listMu.Lock()
+	defer a.listMu.Unlock()
+	for i, d := range a.DindList {
+		if d.Available {
+			a.DindList[i].Available = false
+			a.DindList[i].PodUID = podUID
+			return a.DindList[i].DindID, nil
+		}
+	}
+	return "", fmt.Errorf("no available DIND container")
+}
+
 func (a *DindManager) SetDindUnavailable(dindID string) error {
+	a.listMu.Lock()
+	defer a.listMu.Unlock()
 	for i, d := range a.DindList {
 		if d.DindID == dindID {
 			a.DindList[i].Available = false
@@ -400,6 +465,8 @@ func (a *DindManager) SetDindUnavailable(dindID string) error {
 }
 
 func (a *DindManager) SetDindAvailable(PodUID string) error {
+	a.listMu.Lock()
+	defer a.listMu.Unlock()
 	for i, d := range a.DindList {
 		if d.PodUID == PodUID {
 			a.DindList[i].Available = true
@@ -410,6 +477,8 @@ func (a *DindManager) SetDindAvailable(PodUID string) error {
 }
 
 func (a *DindManager) SetPodUIDToDind(dindID string, podUID string) error {
+	a.listMu.Lock()
+	defer a.listMu.Unlock()
 	for i, d := range a.DindList {
 		if d.DindID == dindID {
 			a.DindList[i].PodUID = podUID
@@ -419,10 +488,47 @@ func (a *DindManager) SetPodUIDToDind(dindID string, podUID string) error {
 	return fmt.Errorf("DIND container %s not found", dindID)
 }
 
+// ReapOrphanNetworks removes DIND bridge networks that have no attached
+// container. A create that fails after its network is created leaves such a
+// network behind; because it still holds its /24 subnet, a later create drawing
+// the same subnet from the pool fails with an address-overlap error. Removing
+// only unattached networks is safe: Docker refuses to remove a network still in
+// use by a live DIND container, so those are skipped. The build-in-flight guard
+// avoids racing a network that was just created but whose container has not yet
+// attached.
+func (a *DindManager) ReapOrphanNetworks() {
+	if atomic.LoadInt32(&a.buildsInFlight) > 0 {
+		return
+	}
+	list := exec.ExecTask{
+		Command: "docker",
+		Args:    []string{"network", "ls", "--filter", "name=_dind_network", "--format", "{{.Name}}"},
+		Shell:   true,
+	}
+	execReturn, err := list.Execute()
+	if err != nil || execReturn.ExitCode != 0 {
+		return
+	}
+	for _, name := range strings.Fields(execReturn.Stdout) {
+		rm := exec.ExecTask{
+			Command: "docker",
+			Args:    []string{"network", "rm", name},
+			Shell:   true,
+		}
+		// Fails harmlessly (non-zero exit) if the network still has a live
+		// container attached; only truly orphaned networks are removed.
+		if r, _ := rm.Execute(); r.ExitCode == 0 {
+			log.G(a.Ctx).Info("🧹 Reaped orphan DIND network " + name)
+		}
+	}
+}
+
 // RemoveDindFromList removes the DinD entry associated with PodUID from the
 // in-memory list, tears down its Docker network, and returns its subnet to
 // the pool so it can be reused by future containers.
 func (a *DindManager) RemoveDindFromList(PodUID string) error {
+	a.listMu.Lock()
+	defer a.listMu.Unlock()
 	for i, d := range a.DindList {
 		if d.PodUID != PodUID {
 			continue

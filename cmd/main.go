@@ -212,6 +212,17 @@ func main() {
 	dindHandler.CleanDindContainers()
 	dindHandler.BuildDindContainers(int8(availableDindsInt))
 
+	// Periodically reclaim orphan DIND networks left behind by failed creates, so
+	// a single failure cannot permanently exhaust the subnet pool. Only networks
+	// with no attached container are removed, and never while a build is running.
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			dindHandler.ReapOrphanNetworks()
+		}
+	}()
+
 	SidecarAPIs := docker.SidecarHandler{
 		Config:      interLinkConfig,
 		Ctx:         ctx,
@@ -275,7 +286,7 @@ func main() {
 
 		// Cleanup the sockfile.
 		c := make(chan os.Signal, 1)
-		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+		signal.Notify(c, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 		go func() {
 			<-c
 			os.Remove(strings.ReplaceAll(interLinkConfig.Socket, "unix://", ""))

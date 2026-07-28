@@ -17,7 +17,6 @@ import (
 	"errors"
 
 	commonIL "github.com/interlink-hq/interlink/pkg/interlink"
-	"github.com/intertwin-eu/interlink-docker-plugin/pkg/docker/dindmanager"
 
 	"path/filepath"
 
@@ -283,39 +282,12 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 		attribute.Int64("start.timestamp", start),
 	))
 
-	// create bool variable to set if a new dind container has to be created
-	newDindContainerCreated := false
-
-	// get a dind container ID from dind manager of the sidecard handler
-	dindContainerID, err := h.DindManager.GetAvailableDind()
-	if err != nil {
-
-		log.G(h.Ctx).Info("\u2705 [POD FLOW] No available DIND container found, creating a new one")
-
-		h.DindManager.BuildDindContainers(1)
-		dindContainerID, err = h.DindManager.GetAvailableDind()
-		if err != nil {
-			HandleErrorAndRemoveData(h, w, "During creation of new DIND container, an error occurred during the request of get available DIND container", err, "", "")
-			return
-		}
-		newDindContainerCreated = true
-	}
-
-	// remove the dind container from the list of available dind containers
-	err = h.DindManager.SetDindUnavailable(dindContainerID)
-	if err != nil {
-		HandleErrorAndRemoveData(h, w, "An error occurred during the removal of the DIND container from the list of available DIND containers", err, "", "")
-		return
-	}
-
-	if !newDindContainerCreated {
-		// create a new dind container in background
-		go h.DindManager.BuildDindContainers(1)
-	}
-
-	//var execReturn exec.ExecResult
 	statusCode := http.StatusOK
 
+	// Read and parse the request body FIRST, so the pod UID is known before a DIND
+	// container is claimed. Claiming with the pod UID (ClaimAvailableDind) makes
+	// the assignment atomic \u2014 Available=false and PodUID are set together \u2014 so a
+	// failure at any later point can always find and clean up the right DIND.
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		HandleErrorAndRemoveData(h, w, "An error occurred during read of body request for pod creation", err, "", "")
@@ -323,20 +295,41 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req commonIL.RetrievedPodData
-	err = json.Unmarshal(bodyBytes, &req)
-
-	if err != nil {
+	if err = json.Unmarshal(bodyBytes, &req); err != nil {
 		HandleErrorAndRemoveData(h, w, "An error occurred during json unmarshal of data from pod creation request", err, "", "")
 		return
 	}
 
-	wd, err := os.Getwd()
+	log.G(h.Ctx).Info("\u2705 [POD FLOW] Request data unmarshalled successfully")
+
+	podNamespace := string(req.Pod.Namespace)
+	podUID := string(req.Pod.UID)
+
+	// Atomically claim a DIND container for this pod.
+	newDindContainerCreated := false
+	dindContainerID, err := h.DindManager.ClaimAvailableDind(podUID)
 	if err != nil {
-		HandleErrorAndRemoveData(h, w, "Unable to get current working directory", err, "", "")
-		return
+
+		log.G(h.Ctx).Info("\u2705 [POD FLOW] No available DIND container found, creating a new one")
+
+		// The build error must be reported: without it the only thing reaching the
+		// caller is the generic "no available DIND container" from the claim below.
+		if buildErr := h.DindManager.BuildDindContainers(1); buildErr != nil {
+			HandleErrorAndRemoveData(h, w, "An error occurred during the creation of a new DIND container", buildErr, podNamespace, podUID)
+			return
+		}
+		dindContainerID, err = h.DindManager.ClaimAvailableDind(podUID)
+		if err != nil {
+			HandleErrorAndRemoveData(h, w, "During creation of new DIND container, an error occurred during the request of get available DIND container", err, podNamespace, podUID)
+			return
+		}
+		newDindContainerCreated = true
 	}
 
-	log.G(h.Ctx).Info("\u2705 [POD FLOW] Request data unmarshalled successfully and current working directory detected")
+	if !newDindContainerCreated {
+		// replenish the pool in the background since we consumed a pre-warmed one
+		go h.DindManager.BuildDindContainers(1)
+	}
 
 	var newReq []commonIL.RetrievedPodData
 	newReq = []commonIL.RetrievedPodData{req}
@@ -346,7 +339,7 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 		podUID := string(data.Pod.UID)
 		podNamespace := string(data.Pod.Namespace)
 
-		podDirectoryPath := filepath.Join(wd, h.Config.DataRootFolder+"/"+podNamespace+"-"+podUID)
+		podDirectoryPath := filepath.Join(h.Config.DataRootFolder, podNamespace+"-"+podUID)
 
 		// Sentinel file written by mesh.sh once network setup is complete.
 		// containers_command.sh polls for this file before starting workload containers.
@@ -365,7 +358,7 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 		if _, err := os.Stat(podDirectoryPath); os.IsNotExist(err) {
 			err = os.MkdirAll(podDirectoryPath, os.ModePerm)
 			if err != nil {
-				HandleErrorAndRemoveData(h, w, "An error occurred during the creation of the pod directory", err, "", "")
+				HandleErrorAndRemoveData(h, w, "An error occurred during the creation of the pod directory", err, podNamespace, podUID)
 				return
 			}
 		}
@@ -373,7 +366,7 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 		// call prepareDockerRuns to get the DockerRunStruct array
 		dockerRunStructs, err := h.prepareDockerRuns(data, w)
 		if err != nil {
-			HandleErrorAndRemoveData(h, w, "An error occurred during preparing of docker run commmands", err, "", "")
+			HandleErrorAndRemoveData(h, w, "An error occurred during preparing of docker run commmands", err, podNamespace, podUID)
 			return
 		}
 
@@ -513,13 +506,6 @@ cd $TMPDIR
 			}
 		}
 
-		// set the podUID to the dind container
-		err = h.DindManager.SetPodUIDToDind(dindContainerID, podUID)
-		if err != nil {
-			HandleErrorAndRemoveData(h, w, "An error occurred during the setting of the pod UID to the DIND container", err, "", "")
-			return
-		}
-
 		// run the docker command to rename the container to the pod UID
 		shell := exec.ExecTask{
 			Command: "docker",
@@ -529,7 +515,7 @@ cd $TMPDIR
 
 		_, err = shell.Execute()
 		if err != nil {
-			HandleErrorAndRemoveData(h, w, "An error occurred during the rename of the DIND container", err, "", "")
+			HandleErrorAndRemoveData(h, w, "An error occurred during the rename of the DIND container", err, podNamespace, podUID)
 			return
 		}
 
@@ -595,7 +581,7 @@ cd $TMPDIR
 		createResponseBytes, err := json.Marshal(createResponse)
 		if err != nil {
 			statusCode = http.StatusInternalServerError
-			HandleErrorAndRemoveData(h, w, "An error occurred during the json marshal of the returned JID", err, "", "")
+			HandleErrorAndRemoveData(h, w, "An error occurred during the json marshal of the returned JID", err, podNamespace, podUID)
 			return
 		}
 
@@ -647,7 +633,7 @@ cd $TMPDIR
 
 					_, err := shell.Execute()
 					if err != nil {
-						HandleErrorAndRemoveData(h, w, "An error occurred during the exec of the init container command", err, "", "")
+						HandleErrorAndRemoveData(h, w, "An error occurred during the exec of the init container command", err, podNamespace, podUID)
 						return
 					}
 
@@ -660,7 +646,7 @@ cd $TMPDIR
 
 						statusReturn, err := shell.Execute()
 						if err != nil {
-							HandleErrorAndRemoveData(h, w, "An error occurred during inspect of init container", err, "", "")
+							HandleErrorAndRemoveData(h, w, "An error occurred during inspect of init container", err, podNamespace, podUID)
 							return
 						}
 
@@ -736,7 +722,7 @@ cd $TMPDIR
 			err = os.WriteFile(podDirectoryPath+"/containers_command.sh", []byte(containersCommand), 0644)
 			if err != nil {
 				log.G(h.Ctx).Error("\u274C [POD FLOW] Error writing containers command script: " + err.Error())
-				HandleErrorAndRemoveData(h, w, "An error occurred during the creation of the container commands script.", err, "", "")
+				HandleErrorAndRemoveData(h, w, "An error occurred during the creation of the container commands script.", err, podNamespace, podUID)
 				return
 			}
 
@@ -752,7 +738,7 @@ cd $TMPDIR
 			_, err = shell.Execute()
 			if err != nil {
 				log.G(h.Ctx).Error("\u274C [POD FLOW] Error executing containers command script: " + err.Error())
-				HandleErrorAndRemoveData(h, w, "An error occurred during the execution of the container command script", err, "", "")
+				HandleErrorAndRemoveData(h, w, "An error occurred during the execution of the container command script", err, podNamespace, podUID)
 				return
 			}
 
@@ -772,34 +758,41 @@ func HandleErrorAndRemoveData(h *SidecarHandler, w http.ResponseWriter, s string
 	if podNamespace != "" && podUID != "" {
 		os.RemoveAll(h.Config.DataRootFolder + podNamespace + "-" + podUID)
 	}
-	dindSpec := dindmanager.DindSpecs{}
-	dindSpec, err = h.DindManager.GetDindFromPodUID(podUID)
 
-	if err != nil {
-		log.G(h.Ctx).Error("\u274C [CREATE CALL] Error retrieving DindSpecs, maybe the Dind container has already been deleted")
-	} else {
-		log.G(h.Ctx).Info("\u2705 [CREATE CALL] Retrieved DindSpecs: " + dindSpec.DindID + " " + dindSpec.PodUID + " " + dindSpec.DindNetworkID + " ")
+	// Without a pod UID there is no DIND to reconcile (e.g. the body was never
+	// parsed). Bail out here rather than matching an unrelated DIND by "".
+	if podUID == "" {
+		return
+	}
 
-		// log the retrieved dindSpec
-		log.G(h.Ctx).Info("\u2705 [CREATE CALL] Retrieved DindSpecs: " + dindSpec.DindID + " " + dindSpec.PodUID + " " + dindSpec.DindNetworkID + " ")
+	dindSpec, lookupErr := h.DindManager.GetDindFromPodUID(podUID)
+	if lookupErr != nil {
+		log.G(h.Ctx).Info("\u2139\uFE0F  [CREATE CALL] No DIND container assigned to pod " + podUID + " to clean up")
+		return
+	}
 
-		cmd := []string{"network", "rm", dindSpec.DindNetworkID}
-		shell := exec.ExecTask{
-			Command: "docker",
-			Args:    cmd,
-			Shell:   true,
+	log.G(h.Ctx).Info("\u2705 [CREATE CALL] Cleaning up DIND for pod " + podUID + ": " + dindSpec.DindID + " (network " + dindSpec.DindNetworkID + ")")
+
+	// Force-remove the DIND container FIRST. While it is running it holds an
+	// endpoint on its bridge network, so the network cannot be removed and its
+	// /24 subnet stays effectively allocated \u2014 which then causes the next create
+	// drawing that subnet from the pool to fail with an address overlap. The
+	// container may be named after the pod UID (after the rename step) or after
+	// its original build UID (before it); remove both, ignoring "no such
+	// container" errors.
+	for _, name := range []string{podUID + "_dind", dindSpec.DindID} {
+		if name == "" {
+			continue
 		}
-		execReturn, _ := shell.Execute()
-		execReturn.Stdout = strings.ReplaceAll(execReturn.Stdout, "\n", "")
-		if execReturn.Stderr != "" {
-			log.G(h.Ctx).Error("\u274C [CREATE CALL] Error deleting network " + dindSpec.DindNetworkID)
-		} else {
-			log.G(h.Ctx).Info("\u2705 [CREATE CALL] Deleted network " + dindSpec.DindNetworkID)
+		rm := exec.ExecTask{Command: "docker", Args: []string{"rm", "-f", name}, Shell: true}
+		if execReturn, rmErr := rm.Execute(); rmErr != nil || execReturn.ExitCode != 0 {
+			log.G(h.Ctx).Warning("\u26A0\uFE0F  [CREATE CALL] Could not remove DIND container " + name + ": " + strings.TrimSpace(execReturn.Stderr))
 		}
-		// set the dind available again
-		err = h.DindManager.RemoveDindFromList(dindSpec.PodUID)
-		if err != nil {
-			log.G(h.Ctx).Error("\u274C [CREATE CALL] Error setting DIND container available")
-		}
+	}
+
+	// Now that the container is gone, RemoveDindFromList can actually delete the
+	// bridge network and return the subnet to the pool.
+	if remErr := h.DindManager.RemoveDindFromList(dindSpec.PodUID); remErr != nil {
+		log.G(h.Ctx).Error("\u274C [CREATE CALL] Error removing DIND from list: " + remErr.Error())
 	}
 }
