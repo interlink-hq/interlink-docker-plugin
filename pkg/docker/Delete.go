@@ -5,13 +5,13 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	exec "github.com/alexellis/go-execute/pkg/v1"
 	"github.com/containerd/containerd/log"
-	commonIL "github.com/interlink-hq/interlink/pkg/interlink"
-	"github.com/intertwin-eu/interlink-docker-plugin/pkg/docker/dindmanager"
+	commonIL "github.com/intertwin-eu/interlink-docker-plugin/pkg/common"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	trace "go.opentelemetry.io/otel/trace"
@@ -57,7 +57,21 @@ func (h *SidecarHandler) DeleteHandler(w http.ResponseWriter, r *http.Request) {
 
 	for _, container := range pod.Spec.Containers {
 		containerName := podNamespace + "-" + podUID + "-" + container.Name
-		h.GpuManager.Release(containerName)
+		// if the FPGA manager is nil we don't need to release the container
+		if h.FPGAManager != nil {
+			// release the container from the FPGA manager
+			err = h.FPGAManager.Release(containerName)
+			if err != nil {
+				log.G(h.Ctx).Error("\u274C [DELETE CALL] Error releasing container " + containerName)
+			}
+		}
+		// same for the GPU manager: it is nil on nodes started without GPU support
+		if h.GpuManager != nil {
+			err = h.GpuManager.Release(containerName)
+			if err != nil {
+				log.G(h.Ctx).Error("\u274C [DELETE CALL] Error releasing GPUs of container " + containerName)
+			}
+		}
 	}
 
 	log.G(h.Ctx).Debug("\u2705 [DELETE CALL] Deleting POD " + podUID + "_dind")
@@ -71,49 +85,40 @@ func (h *SidecarHandler) DeleteHandler(w http.ResponseWriter, r *http.Request) {
 	execReturn, _ = shell.Execute()
 	execReturn.Stdout = strings.ReplaceAll(execReturn.Stdout, "\n", "")
 
-	if execReturn.Stderr != "" {
-		log.G(h.Ctx).Error("\u274C [DELETE CALL] Error deleting container " + podUID + "_dind")
-		statusCode = http.StatusInternalServerError
+	// go-execute reports a nil error for non-zero exits, so inspect ExitCode
+	// rather than Stderr (docker prints benign warnings to stderr on success).
+	// Removing a missing container is NOT treated as fatal: a pod can fail before
+	// its DIND is ever created, and delete must stay idempotent \u2014 returning 500
+	// here would make interLink retry the delete forever.
+	if execReturn.ExitCode != 0 {
+		log.G(h.Ctx).Warning("\u26A0\uFE0F  [DELETE CALL] docker rm -f " + podUID + "_dind exited " +
+			strconv.Itoa(execReturn.ExitCode) + ": " + strings.TrimSpace(execReturn.Stderr))
 	} else {
 		log.G(h.Ctx).Info("\u2705 [DELETE CALL] Deleted container " + podUID + "_dind")
 	}
 
-	dindSpec := dindmanager.DindSpecs{}
-	dindSpec, err = h.DindManager.GetDindFromPodUID(podUID)
-
-	if err != nil {
-		log.G(h.Ctx).Error("\u274C [DELETE CALL] Error retrieving DindSpecs, maybe the Dind container has already been deleted")
+	dindSpec, lookupErr := h.DindManager.GetDindFromPodUID(podUID)
+	if lookupErr != nil {
+		// The in-memory entry may already be gone (a failed create cleaned it, or
+		// it never got a pod UID). We cannot name its network here, but the
+		// orphan-network reaper below reclaims any unattached _dind_network.
+		log.G(h.Ctx).Info("\u2139\uFE0F  [DELETE CALL] No DIND entry for pod " + podUID + " (already removed?)")
 	} else {
-		log.G(h.Ctx).Info("\u2705 [DELETE CALL] Retrieved DindSpecs: " + dindSpec.DindID + " " + dindSpec.PodUID + " " + dindSpec.DindNetworkID + " ")
+		log.G(h.Ctx).Info("\u2705 [DELETE CALL] Retrieved DindSpecs: " + dindSpec.DindID + " " + dindSpec.PodUID + " " + dindSpec.DindNetworkID)
 
-		// log the retrieved dindSpec
-		log.G(h.Ctx).Info("\u2705 [DELETE CALL] Retrieved DindSpecs: " + dindSpec.DindID + " " + dindSpec.PodUID + " " + dindSpec.DindNetworkID + " ")
-
-		cmd = []string{"network", "rm", dindSpec.DindNetworkID}
-		shell = exec.ExecTask{
-			Command: "docker",
-			Args:    cmd,
-			Shell:   true,
-		}
-		execReturn, _ = shell.Execute()
-		execReturn.Stdout = strings.ReplaceAll(execReturn.Stdout, "\n", "")
-		if execReturn.Stderr != "" {
-			log.G(h.Ctx).Error("\u274C [DELETE CALL] Error deleting network " + dindSpec.DindNetworkID)
-		} else {
-			log.G(h.Ctx).Info("\u2705 [DELETE CALL] Deleted network " + dindSpec.DindNetworkID)
-		}
-		// set the dind available again
-		err = h.DindManager.RemoveDindFromList(dindSpec.PodUID)
-		if err != nil {
-			log.G(h.Ctx).Error("\u274C [DELETE CALL] Error setting DIND container available")
+		// RemoveDindFromList removes the bridge network and returns the subnet to
+		// the pool. The DIND container was already force-removed above, so its
+		// network no longer has an attached endpoint and can now be deleted.
+		if remErr := h.DindManager.RemoveDindFromList(dindSpec.PodUID); remErr != nil {
+			log.G(h.Ctx).Error("\u274C [DELETE CALL] Error removing DIND from list: " + remErr.Error())
 		}
 	}
-	wd, err := os.Getwd()
-	if err != nil {
-		HandleErrorAndRemoveData(h, w, "Unable to get current working directory", err, "", "")
-		return
-	}
-	podDirectoryPathToDelete := filepath.Join(wd, h.Config.DataRootFolder+"/"+podNamespace+"-"+podUID)
+
+	// Best-effort: reclaim any orphan DIND networks left behind by a create that
+	// failed before its entry was fully registered.
+	h.DindManager.ReapOrphanNetworks()
+
+	podDirectoryPathToDelete := filepath.Join(h.Config.DataRootFolder, podNamespace+"-"+podUID)
 	log.G(h.Ctx).Info("\u2705 [DELETE CALL] Deleting directory " + podDirectoryPathToDelete)
 
 	err = os.RemoveAll(podDirectoryPathToDelete)

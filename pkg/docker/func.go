@@ -89,6 +89,16 @@ func NewInterLinkConfig() (DockerConfig, error) {
 			InterLinkConfigInst.Tsockspath = path
 		}
 
+		if InterLinkConfigInst.XilinxToolsPath == "" {
+			InterLinkConfigInst.XilinxToolsPath = "/tools/Xilinx/"
+		}
+		if InterLinkConfigInst.VitisPath == "" {
+			InterLinkConfigInst.VitisPath = "/tools/Xilinx/Vitis/2023.2"
+		}
+		if InterLinkConfigInst.XRTPath == "" {
+			InterLinkConfigInst.XRTPath = "/opt/xilinx/xrt"
+		}
+
 		InterLinkConfigInst.set = true
 	}
 	return InterLinkConfigInst, nil
@@ -121,9 +131,9 @@ func SetDurationSpan(startTime int64, span trace.Span, opts ...SpanOption) {
 type SidecarHandler struct {
 	Config             DockerConfig
 	Ctx                context.Context
-	GpuManager         gpustrategies.GPUManagerInterface
 	DindManager        dindmanager.DindManagerInterface
 	FPGAManager        fpgastrategies.FPGAManagerInterface
+	GpuManager         gpustrategies.GPUManagerInterface
 	FinalDNSNameserver string
 	FinalDNSSearch     string
 }
@@ -146,18 +156,13 @@ func parseContainerCommandAndReturnArgs(Ctx context.Context, config DockerConfig
 
 	prefileName := container.Name + "_" + podUID + "_" + podNamespace
 
-	wd, err := os.Getwd()
-	if err != nil {
-		return nil, nil, nil, err
-	}
-
 	if len(container.Command) > 0 {
 
 		fileName := prefileName + "_script.sh"
 
 		if len(container.Args) == 0 {
-			fileNamePath := filepath.Join(wd, config.DataRootFolder+podNamespace+"-"+podUID, fileName)
-			err = os.WriteFile(fileNamePath, []byte(strings.Join(container.Command, " ")), 0644)
+			fileNamePath := filepath.Join(config.DataRootFolder+podNamespace+"-"+podUID, fileName)
+			err := os.WriteFile(fileNamePath, []byte(strings.Join(container.Command, " ")), 0644)
 			if err != nil {
 				log.G(Ctx).Error(err)
 				return nil, nil, nil, err
@@ -166,15 +171,15 @@ func parseContainerCommandAndReturnArgs(Ctx context.Context, config DockerConfig
 		}
 
 		argsFileName := container.Name + "_args"
-		argsFileNamePath := filepath.Join(wd, config.DataRootFolder+podNamespace+"-"+podUID, argsFileName)
-		err = os.WriteFile(argsFileNamePath, []byte(strings.Join(container.Args, " ")), 0644)
+		argsFileNamePath := filepath.Join(config.DataRootFolder+podNamespace+"-"+podUID, argsFileName)
+		err := os.WriteFile(argsFileNamePath, []byte(strings.Join(container.Args, " ")), 0644)
 		if err != nil {
 			log.G(Ctx).Error(err)
 			return nil, nil, nil, err
 		}
 
 		fullFileContent := strings.Join(container.Command, " ") + " \"$(cat " + argsFileName + ")\""
-		fullFileNamePath := filepath.Join(wd, config.DataRootFolder+podNamespace+"-"+podUID, fileName)
+		fullFileNamePath := filepath.Join(config.DataRootFolder+podNamespace+"-"+podUID, fileName)
 		err = os.WriteFile(fullFileNamePath, []byte(fullFileContent), 0644)
 		if err != nil {
 			log.G(Ctx).Error(err)
@@ -254,12 +259,6 @@ func prepareMounts(Ctx context.Context, config DockerConfig, data commonIL.Retri
 }
 
 func mountData(Ctx context.Context, config DockerConfig, pod v1.Pod, data interface{}, container v1.Container) ([]string, error) {
-	wd, err := os.Getwd()
-	if err != nil {
-		log.G(Ctx).Error(err)
-		return nil, err
-	}
-
 	for _, mountSpec := range container.VolumeMounts {
 
 		var podVolumeSpec *v1.VolumeSource
@@ -279,7 +278,7 @@ func mountData(Ctx context.Context, config DockerConfig, pod v1.Pod, data interf
 				}
 
 				if podVolumeSpec != nil && podVolumeSpec.ConfigMap != nil {
-					podConfigMapDir := filepath.Join(wd+"/"+config.DataRootFolder+pod.Namespace+"-"+string(pod.UID)+"/", "configMaps/", vol.Name)
+					podConfigMapDir := filepath.Join(config.DataRootFolder+pod.Namespace+"-"+string(pod.UID), "configMaps", vol.Name)
 					mode := os.FileMode(*podVolumeSpec.ConfigMap.DefaultMode)
 
 					correctMountPath := ""
@@ -330,7 +329,7 @@ func mountData(Ctx context.Context, config DockerConfig, pod v1.Pod, data interf
 				}
 				if podVolumeSpec != nil && podVolumeSpec.Secret != nil {
 					mode := os.FileMode(*podVolumeSpec.Secret.DefaultMode)
-					podSecretDir := filepath.Join(wd+"/"+config.DataRootFolder+pod.Namespace+"-"+string(pod.UID)+"/", "secrets/", vol.Name)
+					podSecretDir := filepath.Join(config.DataRootFolder+pod.Namespace+"-"+string(pod.UID), "secrets", vol.Name)
 
 					if mount.Data != nil {
 						for key := range mount.Data {
@@ -395,7 +394,7 @@ func mountData(Ctx context.Context, config DockerConfig, pod v1.Pod, data interf
 						}
 					}
 
-					edPath = filepath.Join(wd + "/" + config.DataRootFolder + pod.Namespace + "-" + string(pod.UID) + "/" + "emptyDirs/" + vol.Name)
+					edPath = filepath.Join(config.DataRootFolder+pod.Namespace+"-"+string(pod.UID), "emptyDirs", vol.Name)
 					cmd := []string{"-p " + edPath}
 					shell := exec2.ExecTask{
 						Command: "mkdir",
@@ -424,5 +423,5 @@ func mountData(Ctx context.Context, config DockerConfig, pod v1.Pod, data interf
 		}
 	}
 
-	return nil, err
+	return nil, errors.New("Volume " + container.Name + " not found in pod spec")
 }

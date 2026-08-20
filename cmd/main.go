@@ -163,6 +163,9 @@ func main() {
 		log.G(context.Background()).Fatal(err)
 	}
 
+	// log the interlinkconfig
+	log.G(context.Background()).Info("\u2705 InterLinkConfig: ", interLinkConfig)
+
 	if interLinkConfig.VerboseLogging {
 		logger.SetLevel(logrus.DebugLevel)
 	} else if interLinkConfig.ErrorsOnlyLogging {
@@ -178,16 +181,48 @@ func main() {
 	if availableDinds == "" {
 		availableDinds = "2"
 	}
-	var dindHandler dindmanager.DindManagerInterface = &dindmanager.DindManager{
-		DindList: []dindmanager.DindSpecs{},
-		Ctx:      ctx,
-	}
 	availableDindsInt, err := strconv.ParseInt(availableDinds, 10, 8)
 	if err != nil {
-		log.G(ctx).Info("\u2705 Error parsing availableDinds")
+		log.G(ctx).Fatal("Error parsing AVAILABLEDINDS: ", err)
 	}
+
+	// Build the subnet pool from the config (empty slice = no pool).
+	subnetPool, err := dindmanager.InitSubnetPool(interLinkConfig.DockerNetworkSubnet)
+	if err != nil {
+		log.G(ctx).Fatal("Error initialising subnet pool: ", err)
+	}
+	if len(subnetPool) > 0 {
+		log.G(ctx).Info(fmt.Sprintf(
+			"\u2705 Subnet pool initialised: %d /24 subnets available from %v",
+			len(subnetPool), interLinkConfig.DockerNetworkSubnet,
+		))
+	} else {
+		log.G(ctx).Info("\u2705 No DockerNetworkSubnet configured — Docker will assign subnets automatically")
+	}
+
+	var dindHandler dindmanager.DindManagerInterface = &dindmanager.DindManager{
+		DindList:        []dindmanager.DindSpecs{},
+		Ctx:             ctx,
+		FPGAEnabled:     interLinkConfig.FPGAEnabled,
+		XilinxToolsPath: interLinkConfig.XilinxToolsPath,
+		SubnetPool:      subnetPool,
+	}
+
+	dindHandler.(*dindmanager.DindManager).InitialPoolSz = len(subnetPool)
+
 	dindHandler.CleanDindContainers()
 	dindHandler.BuildDindContainers(int8(availableDindsInt))
+
+	// Periodically reclaim orphan DIND networks left behind by failed creates, so
+	// a single failure cannot permanently exhaust the subnet pool. Only networks
+	// with no attached container are removed, and never while a build is running.
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			dindHandler.ReapOrphanNetworks()
+		}
+	}()
 
 	var gpuManager gpustrategies.GPUManagerInterface = &gpustrategies.GPUManager{
 		GPUSpecsList: []gpustrategies.GPUSpecs{},
@@ -196,17 +231,17 @@ func main() {
 
 	err = gpuManager.Init()
 	if err != nil {
-		log.G(ctx).Info("\u274C Init of GPUs failed, error", err)
+		log.G(ctx).Info("❌ Init of GPUs failed, error", err)
 	}
 
 	err = gpuManager.Discover()
 	if err != nil {
-		log.G(ctx).Info("\u274C Discover of GPUs failed, error: ", err)
+		log.G(ctx).Info("❌ Discover of GPUs failed, error: ", err)
 	}
 
 	err = gpuManager.Check()
 	if err != nil {
-		log.G(ctx).Info("\u274C Check of GPUs failed, error: ", err)
+		log.G(ctx).Info("❌ Check of GPUs failed, error: ", err)
 	}
 
 	SidecarAPIs := docker.SidecarHandler{
@@ -236,10 +271,12 @@ func main() {
 		log.G(ctx).Info("\u2705 Tracing is disabled")
 	}
 
-	if os.Getenv("FPGAENABLED") == "1" {
+	if interLinkConfig.FPGAEnabled {
 		fpgaManager := &fpgastrategies.FPGAManager{
 			FPGASpecsList: []fpgastrategies.FPGASpecs{},
 			Ctx:           ctx,
+			VitisPath:     interLinkConfig.VitisPath,
+			XRTPath:       interLinkConfig.XRTPath,
 		}
 		err = fpgaManager.Init()
 		if err != nil {
@@ -271,7 +308,7 @@ func main() {
 
 		// Cleanup the sockfile.
 		c := make(chan os.Signal, 1)
-		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+		signal.Notify(c, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 		go func() {
 			<-c
 			os.Remove(strings.ReplaceAll(interLinkConfig.Socket, "unix://", ""))

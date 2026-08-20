@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	OSexec "os/exec"
+
 	exec "github.com/alexellis/go-execute/pkg/v1"
 	"github.com/containerd/containerd/log"
 	v1 "k8s.io/api/core/v1"
@@ -17,7 +20,6 @@ import (
 	"errors"
 
 	commonIL "github.com/interlink-hq/interlink/pkg/interlink"
-	"github.com/intertwin-eu/interlink-docker-plugin/pkg/docker/dindmanager"
 
 	"path/filepath"
 
@@ -26,11 +28,49 @@ import (
 	trace "go.opentelemetry.io/otel/trace"
 )
 
+const (
+	// meshReadyTimeoutSeconds bounds how long containers_command.sh waits for the
+	// mesh_ready sentinel written by the network-overlay container.
+	meshReadyTimeoutSeconds = 300
+
+	// containersCommandTimeout bounds the whole containers_command.sh execution
+	// inside the DIND container. It must be larger than meshReadyTimeoutSeconds so
+	// the script gets the chance to report the mesh timeout itself.
+	containersCommandTimeout = 10 * time.Minute
+)
+
+// selectNetworkOverlay splits containers into the network-overlay container and
+// the workload containers that have to wait for the mesh sentinel it writes.
+// ok is false when overlayName is empty (no overlay was built for this pod) or
+// when no container carries that name, in which case overlay is the zero value
+// and workload holds every container unchanged.
+//
+// The overlay is prepended to the list, so it is normally at index 0. Taking it
+// from there unconditionally was the bug: the condition that selected the mesh
+// startup path (the pod carries a mesh annotation) is weaker than the conditions
+// under which the overlay is actually built, so when the two disagreed an
+// ordinary workload container was started as the overlay and every other
+// container waited on a sentinel nothing would ever write. It also panicked on
+// an empty container list. Matching by name makes the two impossible to confuse.
+func selectNetworkOverlay(containers []DockerRunStruct, overlayName string) (overlay DockerRunStruct, workload []DockerRunStruct, ok bool) {
+	if overlayName == "" {
+		return DockerRunStruct{}, containers, false
+	}
+	for idx, c := range containers {
+		if c.Name != overlayName {
+			continue
+		}
+		workload = make([]DockerRunStruct, 0, len(containers)-1)
+		workload = append(workload, containers[:idx]...)
+		workload = append(workload, containers[idx+1:]...)
+		return c, workload, true
+	}
+	return DockerRunStruct{}, containers, false
+}
+
 func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w http.ResponseWriter) ([]DockerRunStruct, error) {
 
 	var dockerRunStructs []DockerRunStruct
-	var gpuArgs string = ""
-	var fpgaArgs string = ""
 
 	podUID := string(podData.Pod.UID)
 	podNamespace := string(podData.Pod.Namespace)
@@ -82,6 +122,14 @@ func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w 
 
 		for _, container := range containers {
 
+			// envVars, fpgaArgs and gpuArgs MUST be scoped to the single container:
+			// when they were declared outside this loop every container inherited the
+			// -e/-v flags, --device entries and GPU assignment of the containers
+			// processed before it.
+			var envVars string = ""
+			var fpgaArgs string = ""
+			var gpuArgs string = ""
+
 			containerName := podNamespace + "-" + podUID + "-" + container.Name
 
 			var isGpuRequested bool = false
@@ -94,10 +142,16 @@ func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w 
 
 				// if the container is requesting 0 GPU, skip the GPU assignment
 				if numGpusRequested == 0 {
-					log.G(h.Ctx).Info("\u2705 Container " + containerName + " is not requesting a GPU")
+					log.G(h.Ctx).Info("✅ Container " + containerName + " is not requesting a GPU")
 				} else {
 
-					log.G(h.Ctx).Info("\u2705 Container " + containerName + " is requesting " + val.String() + " GPU")
+					if h.GpuManager == nil {
+						log.G(h.Ctx).Error("❌ [CREATE CALL] GPU Manager is not initialized")
+						HandleErrorAndRemoveData(h, w, "GPU Manager is not initialized", errors.New("GPU Manager is not initialized"), podNamespace, podUID)
+						return dockerRunStructs, errors.New("GPU Manager is not initialized")
+					}
+
+					log.G(h.Ctx).Info("✅ Container " + containerName + " is requesting " + val.String() + " GPU")
 
 					isGpuRequested = true
 
@@ -127,7 +181,6 @@ func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w 
 					additionalGpuArgs = append(additionalGpuArgs, "--runtime=nvidia -e NVIDIA_VISIBLE_DEVICES="+gpuUUIDs)
 					gpuArgs = "--runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=" + gpuUUIDs
 				}
-
 			}
 
 			if val, ok := container.Resources.Limits["xilinx.com/fpga"]; ok {
@@ -136,19 +189,39 @@ func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w 
 					log.G(h.Ctx).Info("\u2705 Container " + containerName + " is not requesting a FPGA")
 				} else {
 
+					if h.FPGAManager == nil {
+						log.G(h.Ctx).Error("\u274C [CREATE CALL] FPGA Manager is not initialized")
+						HandleErrorAndRemoveData(h, w, "FPGA Manager is not initialized", errors.New("FPGA Manager is not initialized"), podNamespace, podUID)
+						return dockerRunStructs, errors.New("FPGA Manager is not initialized")
+					}
+
 					isFPGARequested = true
 					log.G(h.Ctx).Info("\u2705 Container " + containerName + " is requesting " + strconv.Itoa(int(numFPGAsRequested)) + " FPGA(s)")
 
 					numFPGAsRequestedInt := int(numFPGAsRequested)
 					_, err := h.FPGAManager.GetAvailableFPGAs(numFPGAsRequestedInt)
+					log.G(h.Ctx).Info("\u2705 [CREATE CALL] Retrieved available FPGAs")
 					if err != nil {
+						// log the err
+						log.G(h.Ctx).Error("\u274C [CREATE CALL] Error retrieving available FPGAs")
 						HandleErrorAndRemoveData(h, w, "An error occurred during the request of available FPGAs", err, podNamespace, podUID)
 						return dockerRunStructs, errors.New("An error occurred during the request of available FPGAs")
 					}
+
+					log.G(h.Ctx).Info("\u2705 [CREATE CALL] ********* BEFORE Requested FPGAs are available")
+
 					assignedFPGAs, err := h.FPGAManager.GetAndAssignAvailableFPGAs(numFPGAsRequestedInt, containerName)
+					log.G(h.Ctx).Info("\u2705 [CREATE CALL] ********* AFTER Requested FPGAs are available")
+
+					// log the assigned FPGAs
+					log.G(h.Ctx).Info("\u2705 [CREATE CALL] Assigned FPGAs: ")
+					for _, fpgaSpec := range assignedFPGAs {
+						log.G(h.Ctx).Info("\u2705 [CREATE CALL] " + fpgaSpec.DeviceToMount)
+					}
 					if err != nil {
-						HandleErrorAndRemoveData(h, w, "An error occurred during request of get and assign of an available GPU", err, podNamespace, podUID)
-						return dockerRunStructs, errors.New("An error occurred during request of get and assign of an available GPU")
+						log.G(h.Ctx).Error("\u274C [CREATE CALL] Error during request of get and assign of an available FPGA")
+						HandleErrorAndRemoveData(h, w, "An error occurred during request of get and assign of an available FPGA", err, podNamespace, podUID)
+						return dockerRunStructs, errors.New("An error occurred during request of get and assign of an available FPGA")
 					}
 					for _, fpgaSpec := range assignedFPGAs {
 						fpgaArgs += " --device=" + fpgaSpec.DeviceToMount + ":" + fpgaSpec.DeviceToMount
@@ -156,7 +229,6 @@ func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w 
 				}
 			}
 
-			var envVars string
 			for _, envVar := range container.Env {
 				if envVar.Value != "" {
 					value := envVar.Value
@@ -200,6 +272,13 @@ func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w 
 				}
 			}
 
+			// if FPGA is requested, mount in read mode the Xilinx tools path in the container
+			if isFPGARequested {
+				envVars += " -v " + h.Config.XilinxToolsPath + ":" + h.Config.XilinxToolsPath + ":ro"
+			}
+
+			log.G(h.Ctx).Info("\u2705 [POD FLOW] Before creating run command")
+
 			//envVars += " --network=host"
 			cmd := []string{"run", "--user", "root", "-d", "--name", containerName}
 
@@ -220,10 +299,11 @@ func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w 
 			var additionalPortArgs []string
 
 			for _, port := range container.Ports {
-				if port.HostPort != 0 {
-					additionalPortArgs = append(additionalPortArgs, "-p", strconv.Itoa(int(port.HostPort))+":"+strconv.Itoa(int(port.ContainerPort)))
-				}
+				log.G(h.Ctx).Info("\u2705 [POD FLOW] Container port: " + strconv.Itoa(int(port.ContainerPort)) + " Protocol: " + string(port.Protocol) + " HostPort: " + strconv.Itoa(int(port.HostPort)))
+				additionalPortArgs = append(additionalPortArgs, "-p", strconv.Itoa(int(port.ContainerPort))+":"+strconv.Itoa(int(port.ContainerPort)))
 			}
+
+			log.G(h.Ctx).Info("\u2705 [POD FLOW] Additional port arguments for container " + containerName + ": " + strings.Join(additionalPortArgs, " "))
 
 			cmd = append(cmd, additionalPortArgs...)
 
@@ -304,39 +384,12 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 		attribute.Int64("start.timestamp", start),
 	))
 
-	// create bool variable to set if a new dind container has to be created
-	newDindContainerCreated := false
-
-	// get a dind container ID from dind manager of the sidecard handler
-	dindContainerID, err := h.DindManager.GetAvailableDind()
-	if err != nil {
-
-		log.G(h.Ctx).Info("\u2705 [POD FLOW] No available DIND container found, creating a new one")
-
-		h.DindManager.BuildDindContainers(1)
-		dindContainerID, err = h.DindManager.GetAvailableDind()
-		if err != nil {
-			HandleErrorAndRemoveData(h, w, "During creation of new DIND container, an error occurred during the request of get available DIND container", err, "", "")
-			return
-		}
-		newDindContainerCreated = true
-	}
-
-	// remove the dind container from the list of available dind containers
-	err = h.DindManager.SetDindUnavailable(dindContainerID)
-	if err != nil {
-		HandleErrorAndRemoveData(h, w, "An error occurred during the removal of the DIND container from the list of available DIND containers", err, "", "")
-		return
-	}
-
-	if !newDindContainerCreated {
-		// create a new dind container in background
-		go h.DindManager.BuildDindContainers(1)
-	}
-
-	//var execReturn exec.ExecResult
 	statusCode := http.StatusOK
 
+	// Read and parse the request body FIRST, so the pod UID is known before a DIND
+	// container is claimed. Claiming with the pod UID (ClaimAvailableDind) makes
+	// the assignment atomic \u2014 Available=false and PodUID are set together \u2014 so a
+	// failure at any later point can always find and clean up the right DIND.
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		HandleErrorAndRemoveData(h, w, "An error occurred during read of body request for pod creation", err, "", "")
@@ -344,20 +397,41 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req commonIL.RetrievedPodData
-	err = json.Unmarshal(bodyBytes, &req)
-
-	if err != nil {
+	if err = json.Unmarshal(bodyBytes, &req); err != nil {
 		HandleErrorAndRemoveData(h, w, "An error occurred during json unmarshal of data from pod creation request", err, "", "")
 		return
 	}
 
-	wd, err := os.Getwd()
+	log.G(h.Ctx).Info("\u2705 [POD FLOW] Request data unmarshalled successfully")
+
+	podNamespace := string(req.Pod.Namespace)
+	podUID := string(req.Pod.UID)
+
+	// Atomically claim a DIND container for this pod.
+	newDindContainerCreated := false
+	dindContainerID, err := h.DindManager.ClaimAvailableDind(podUID)
 	if err != nil {
-		HandleErrorAndRemoveData(h, w, "Unable to get current working directory", err, "", "")
-		return
+
+		log.G(h.Ctx).Info("\u2705 [POD FLOW] No available DIND container found, creating a new one")
+
+		// The build error must be reported: without it the only thing reaching the
+		// caller is the generic "no available DIND container" from the claim below.
+		if buildErr := h.DindManager.BuildDindContainers(1); buildErr != nil {
+			HandleErrorAndRemoveData(h, w, "An error occurred during the creation of a new DIND container", buildErr, podNamespace, podUID)
+			return
+		}
+		dindContainerID, err = h.DindManager.ClaimAvailableDind(podUID)
+		if err != nil {
+			HandleErrorAndRemoveData(h, w, "During creation of new DIND container, an error occurred during the request of get available DIND container", err, podNamespace, podUID)
+			return
+		}
+		newDindContainerCreated = true
 	}
 
-	log.G(h.Ctx).Info("\u2705 [POD FLOW] Request data unmarshalled successfully and current working directory detected")
+	if !newDindContainerCreated {
+		// replenish the pool in the background since we consumed a pre-warmed one
+		go h.DindManager.BuildDindContainers(1)
+	}
 
 	var newReq []commonIL.RetrievedPodData
 	newReq = []commonIL.RetrievedPodData{req}
@@ -367,7 +441,11 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 		podUID := string(data.Pod.UID)
 		podNamespace := string(data.Pod.Namespace)
 
-		podDirectoryPath := filepath.Join(wd, h.Config.DataRootFolder+"/"+podNamespace+"-"+podUID)
+		podDirectoryPath := filepath.Join(h.Config.DataRootFolder, podNamespace+"-"+podUID)
+
+		// Sentinel file written by mesh.sh once network setup is complete.
+		// containers_command.sh polls for this file before starting workload containers.
+		meshReadyFile := filepath.Join(podDirectoryPath, "mesh_ready")
 
 		// log the pod specifics
 		log.G(h.Ctx).Info(fmt.Sprintf("\u2705 [POD FLOW] Pod specs: %+v", data.Pod))
@@ -382,7 +460,7 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 		if _, err := os.Stat(podDirectoryPath); os.IsNotExist(err) {
 			err = os.MkdirAll(podDirectoryPath, os.ModePerm)
 			if err != nil {
-				HandleErrorAndRemoveData(h, w, "An error occurred during the creation of the pod directory", err, "", "")
+				HandleErrorAndRemoveData(h, w, "An error occurred during the creation of the pod directory", err, podNamespace, podUID)
 				return
 			}
 		}
@@ -390,9 +468,17 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 		// call prepareDockerRuns to get the DockerRunStruct array
 		dockerRunStructs, err := h.prepareDockerRuns(data, w)
 		if err != nil {
-			HandleErrorAndRemoveData(h, w, "An error occurred during preparing of docker run commmands", err, "", "")
+			HandleErrorAndRemoveData(h, w, "An error occurred during preparing of docker run commmands", err, podNamespace, podUID)
 			return
 		}
+
+		// Name of the network-overlay container, set below only if one is actually
+		// built and prepended to dockerRunStructs. Everything downstream keys off
+		// this instead of re-testing the annotation: the annotation check and the
+		// overlay creation do not have the same preconditions, and assuming they
+		// agree is what made the startup script treat an ordinary workload container
+		// as the overlay.
+		networkOverlayName := ""
 
 		if preExecAnnotations, ok := data.Pod.Annotations["slurm-job.vk.io/pre-exec"]; ok {
 			if strings.Contains(preExecAnnotations, "cat <<'EOFMESH' > $TMPDIR/mesh.sh") {
@@ -430,13 +516,16 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 						// Remove the slirp4netns execution at the end of inner script
 						innerScript = removeSlirp4netnsExecution(innerScript)
 
-						// Replace command execution with sleep infinity
-						innerScript = strings.Replace(innerScript, "$@", "sleep infinity", -1)
+						// Replace command execution with a sentinel touch followed by sleep infinity.
+						// The sentinel file signals to containers_command.sh that network setup is done.
+						innerScript = strings.Replace(innerScript, "$@", "touch "+meshReadyFile+" && sleep infinity", -1)
 
 						// Build the complete script with correct order
 						meshScript = `#!/bin/bash
 set -e
 set -m
+
+sleep 20s
 
 export PATH=$PATH:$PWD:/usr/sbin:/sbin
 
@@ -453,10 +542,10 @@ cd $TMPDIR
 
 ` + innerScript
 					} else {
-						// Fallback: just clean up the outer script
+						// Fallback: just clean up the outer script, still touch the sentinel before sleeping.
 						meshScript = removeSlirp4netnsDownload(meshScript)
 						meshScript = removeUnshareWrapper(meshScript)
-						meshScript = strings.Replace(meshScript, "$@", "sleep infinity", -1)
+						meshScript = strings.Replace(meshScript, "$@", "touch "+meshReadyFile+" && sleep infinity", -1)
 						meshScript = removeSlirp4netnsExecution(meshScript)
 					}
 
@@ -501,6 +590,8 @@ cd $TMPDIR
 						FpgaArgs:        "",
 					}}, dockerRunStructs...)
 
+					networkOverlayName = networkContainerName
+
 					log.G(h.Ctx).Info("✅ [POD FLOW] Network overlay container prepared: " + networkContainerName)
 				} else {
 					log.G(h.Ctx).Error("❌ [POD FLOW] Failed to extract mesh.sh script from annotation")
@@ -527,13 +618,6 @@ cd $TMPDIR
 			}
 		}
 
-		// set the podUID to the dind container
-		err = h.DindManager.SetPodUIDToDind(dindContainerID, podUID)
-		if err != nil {
-			HandleErrorAndRemoveData(h, w, "An error occurred during the setting of the pod UID to the DIND container", err, "", "")
-			return
-		}
-
 		// run the docker command to rename the container to the pod UID
 		shell := exec.ExecTask{
 			Command: "docker",
@@ -543,7 +627,7 @@ cd $TMPDIR
 
 		_, err = shell.Execute()
 		if err != nil {
-			HandleErrorAndRemoveData(h, w, "An error occurred during the rename of the DIND container", err, "", "")
+			HandleErrorAndRemoveData(h, w, "An error occurred during the rename of the DIND container", err, podNamespace, podUID)
 			return
 		}
 
@@ -568,40 +652,40 @@ cd $TMPDIR
 				}
 
 				// Create DNS configuration script for DIND
-				dnsConfigScript := `#!/bin/sh
-set -e
+				/* 				dnsConfigScript := `#!/bin/sh
+				set -e
 
-# Backup original resolv.conf
-cp /etc/resolv.conf /etc/resolv.conf.backup 2>/dev/null || true
+				# Backup original resolv.conf
+				cp /etc/resolv.conf /etc/resolv.conf.backup 2>/dev/null || true
 
-# Create new resolv.conf with cluster DNS
-cat > /etc/resolv.conf << EOF
-nameserver 8.8.8.8 
-search ` + dnsSearch + `
-EOF
+				# Create new resolv.conf with cluster DNS
+				cat > /etc/resolv.conf << EOF
+				nameserver 8.8.8.8
+				search ` + dnsSearch + `
+				EOF
 
-echo "DNS configured for cluster connectivity"
-`
+				echo "DNS configured for cluster connectivity"
+				`
 
-				// Write DNS config script to pod directory
-				dnsScriptPath := filepath.Join(podDirectoryPath, "configure-dns.sh")
-				err = os.WriteFile(dnsScriptPath, []byte(dnsConfigScript), 0755)
-				if err != nil {
-					log.G(h.Ctx).Warning("⚠️  Failed to create DNS config script: " + err.Error())
-				} else {
-					// Execute DNS configuration on DIND container
-					dnsExecCmd := exec.ExecTask{
-						Command: "docker",
-						Args:    []string{"exec", string(data.Pod.UID) + "_dind", "sh", dnsScriptPath},
-						Shell:   true,
-					}
-					_, err = dnsExecCmd.Execute()
-					if err != nil {
-						log.G(h.Ctx).Warning("⚠️  Failed to configure DNS on DIND container: " + err.Error())
-					} else {
-						log.G(h.Ctx).Info("✅ [POD FLOW] DNS configured on DIND container successfully with NS: " + dnsNameserver + ", Search: " + dnsSearch)
-					}
-				}
+								// Write DNS config script to pod directory
+								dnsScriptPath := filepath.Join(podDirectoryPath, "configure-dns.sh")
+								err = os.WriteFile(dnsScriptPath, []byte(dnsConfigScript), 0755)
+								if err != nil {
+									log.G(h.Ctx).Warning("⚠️  Failed to create DNS config script: " + err.Error())
+								} else {
+									// Execute DNS configuration on DIND container
+									dnsExecCmd := exec.ExecTask{
+										Command: "docker",
+										Args:    []string{"exec", string(data.Pod.UID) + "_dind", "sh", dnsScriptPath},
+										Shell:   true,
+									}
+									_, err = dnsExecCmd.Execute()
+									if err != nil {
+										log.G(h.Ctx).Warning("⚠️  Failed to configure DNS on DIND container: " + err.Error())
+									} else {
+										log.G(h.Ctx).Info("✅ [POD FLOW] DNS configured on DIND container successfully with NS: " + dnsNameserver + ", Search: " + dnsSearch)
+									}
+								} */
 			}
 		}
 
@@ -609,7 +693,7 @@ echo "DNS configured for cluster connectivity"
 		createResponseBytes, err := json.Marshal(createResponse)
 		if err != nil {
 			statusCode = http.StatusInternalServerError
-			HandleErrorAndRemoveData(h, w, "An error occurred during the json marshal of the returned JID", err, "", "")
+			HandleErrorAndRemoveData(h, w, "An error occurred during the json marshal of the returned JID", err, podNamespace, podUID)
 			return
 		}
 
@@ -633,6 +717,17 @@ echo "DNS configured for cluster connectivity"
 		span.End()
 
 		go func() {
+			// The HTTP response has already been sent at this point, so nothing below
+			// may touch w. A panic here would also not be recovered by net/http (it is
+			// a bare goroutine, not the handler), and would take the whole plugin down
+			// together with the bookkeeping of every other running pod.
+			defer func() {
+				if r := recover(); r != nil {
+					log.G(h.Ctx).Errorf("❌ [POD FLOW] panic while creating containers for pod %s: %v", podUID, r)
+					cleanupPodData(h, "Panic during asynchronous container creation",
+						fmt.Errorf("panic: %v", r), podNamespace, podUID)
+				}
+			}()
 
 			if len(initContainers) > 0 {
 
@@ -661,7 +756,7 @@ echo "DNS configured for cluster connectivity"
 
 					_, err := shell.Execute()
 					if err != nil {
-						HandleErrorAndRemoveData(h, w, "An error occurred during the exec of the init container command", err, "", "")
+						cleanupPodData(h, "An error occurred during the exec of the init container command", err, podNamespace, podUID)
 						return
 					}
 
@@ -674,7 +769,7 @@ echo "DNS configured for cluster connectivity"
 
 						statusReturn, err := shell.Execute()
 						if err != nil {
-							HandleErrorAndRemoveData(h, w, "An error occurred during inspect of init container", err, "", "")
+							cleanupPodData(h, "An error occurred during inspect of init container", err, podNamespace, podUID)
 							return
 						}
 
@@ -696,7 +791,14 @@ echo "DNS configured for cluster connectivity"
 			// create a file called containers_command.sh and write the containers commands to it, use WriteFile function
 			containersCommand := "#!/bin/sh\n"
 
-			if isMeshScriptPresent {
+			networkOverlay, workloadContainers, hasOverlay := selectNetworkOverlay(containers, networkOverlayName)
+
+			if isMeshScriptPresent && !hasOverlay {
+				log.G(h.Ctx).Warning("⚠️  [POD FLOW] Pod " + podUID + " carries a mesh pre-exec annotation but no network-overlay " +
+					"container was created; starting its containers directly, without cluster network setup or cluster DNS")
+			}
+
+			if hasOverlay {
 
 				dnsNameserver := h.FinalDNSNameserver
 				dnsSearch := h.FinalDNSSearch
@@ -708,12 +810,31 @@ echo "DNS configured for cluster connectivity"
 					dnsSearch = "default.svc.cluster.local svc.cluster.local cluster.local" // Fallback
 				}
 
-				// Add a delay to ensure network container is ready
-				containersCommand += "echo 'Waiting for network overlay to be ready...'\n"
-				containersCommand += "sleep 10\n"
-				containersCommand += "echo 'Starting containers...'\n\n"
+				containersCommand += "# Start network overlay container first\n"
+				containersCommand += networkOverlay.Command + "\n\n"
 
-				for _, container := range containers {
+				// Poll for the sentinel file written by mesh.sh once network setup is
+				// complete. The wait MUST be bounded: mesh.sh downloads binaries and
+				// brings up WireGuard, and when any of that fails the sentinel is never
+				// written. An unbounded loop left the docker exec below blocked with no
+				// diagnostics, the pod stuck in Waiting and its DIND claimed until a
+				// human deleted the pod. Timing out instead fails the pod loudly and
+				// lets the deferred cleanup reclaim the DIND.
+				containersCommand += "echo 'Waiting for network overlay to be ready (timeout " + strconv.Itoa(meshReadyTimeoutSeconds) + "s)...'\n"
+				containersCommand += "meshWaited=0\n"
+				containersCommand += "while [ ! -f " + meshReadyFile + " ]; do\n"
+				containersCommand += "  if [ \"$meshWaited\" -ge " + strconv.Itoa(meshReadyTimeoutSeconds) + " ]; then\n"
+				containersCommand += "    echo 'ERROR: network overlay did not become ready after " + strconv.Itoa(meshReadyTimeoutSeconds) + "s; aborting container startup'\n"
+				containersCommand += "    docker logs " + networkOverlay.Name + " 2>&1 | tail -n 50\n"
+				containersCommand += "    exit 1\n"
+				containersCommand += "  fi\n"
+				containersCommand += "  echo \"Network not ready yet, waiting 2s (${meshWaited}s elapsed)...\"\n"
+				containersCommand += "  sleep 2\n"
+				containersCommand += "  meshWaited=$((meshWaited+2))\n"
+				containersCommand += "done\n"
+				containersCommand += "echo 'Network overlay is ready (sentinel file found), starting containers...'\n\n"
+
+				for _, container := range workloadContainers {
 					containersCommand += "# Start container: " + container.Name + "\n"
 					containersCommand += container.Command + "\n"
 					containersCommand += "sleep 2\n"
@@ -724,37 +845,44 @@ echo "DNS configured for cluster connectivity"
 					containersCommand += "cp /etc/resolv.conf /etc/resolv.conf.backup 2>/dev/null || true\n"
 					containersCommand += "cat > /etc/resolv.conf << EOF\n"
 					containersCommand += "nameserver " + dnsNameserver + "\n"
+					containersCommand += "nameserver 8.8.8.8 \n"
 					containersCommand += "search " + dnsSearch + "\n"
 					containersCommand += "EOF\n"
 					containersCommand += "' || echo 'Warning: Could not configure DNS for " + container.Name + "'\n"
 					containersCommand += "echo 'DNS configured for container: " + container.Name + "'\n\n"
 				}
-			}
-
-			for _, container := range containers {
-				containersCommand += container.Command + "\n"
-				containersCommand += "sleep 30\n"
+			} else {
+				for _, container := range containers {
+					containersCommand += container.Command + "\n"
+					containersCommand += "sleep 1\n"
+				}
 			}
 			err = os.WriteFile(podDirectoryPath+"/containers_command.sh", []byte(containersCommand), 0644)
 			if err != nil {
 				log.G(h.Ctx).Error("\u274C [POD FLOW] Error writing containers command script: " + err.Error())
-				HandleErrorAndRemoveData(h, w, "An error occurred during the creation of the container commands script.", err, "", "")
+				cleanupPodData(h, "An error occurred during the creation of the container commands script.", err, podNamespace, podUID)
 				return
 			}
 
 			log.G(h.Ctx).Info("\u2705 [POD FLOW] Containers commands written to the script file")
 
-			shell = exec.ExecTask{
-				Command: "docker",
-				Args:    []string{"exec", string(data.Pod.UID) + "_dind", "/bin/sh", podDirectoryPath + "/containers_command.sh"},
-			}
+			// Bound the exec as well, so a script that blocks for any other reason
+			// cannot leak this goroutine and keep the DIND claimed forever. Unlike
+			// go-execute, OSexec.CommandContext can be cancelled.
+			execCtx, cancelExec := context.WithTimeout(h.Ctx, containersCommandTimeout)
+			defer cancelExec()
 
-			log.G(h.Ctx).Info("\u2705 [POD FLOW] Executing containers creation script inside DIND container; command to execute: docker " + strings.Join(shell.Args, " "))
+			execArgs := []string{"exec", string(data.Pod.UID) + "_dind", "/bin/sh", podDirectoryPath + "/containers_command.sh"}
+			log.G(h.Ctx).Info("\u2705 [POD FLOW] Executing containers creation script inside DIND container; command to execute: docker " + strings.Join(execArgs, " "))
 
-			_, err = shell.Execute()
+			scriptOutput, err := OSexec.CommandContext(execCtx, "docker", execArgs...).CombinedOutput()
 			if err != nil {
+				if execCtx.Err() == context.DeadlineExceeded {
+					err = fmt.Errorf("containers command script timed out after %s: %w", containersCommandTimeout, err)
+				}
 				log.G(h.Ctx).Error("\u274C [POD FLOW] Error executing containers command script: " + err.Error())
-				HandleErrorAndRemoveData(h, w, "An error occurred during the execution of the container command script", err, "", "")
+				log.G(h.Ctx).Error("\u274C [POD FLOW] Script output: " + strings.TrimSpace(string(scriptOutput)))
+				cleanupPodData(h, "An error occurred during the execution of the container command script", err, podNamespace, podUID)
 				return
 			}
 
@@ -765,43 +893,65 @@ echo "DNS configured for cluster connectivity"
 
 }
 
+// HandleErrorAndRemoveData reports the failure on the HTTP response and then
+// reclaims everything provisioned for the pod. It may only be called from the
+// request goroutine, before the response has been written; anything running
+// after the handler returned must call cleanupPodData directly, because writing
+// to a ResponseWriter after its handler returned races with the http server and
+// can corrupt the next response on a keep-alive connection.
 func HandleErrorAndRemoveData(h *SidecarHandler, w http.ResponseWriter, s string, err error, podNamespace string, podUID string) {
-	log.G(h.Ctx).Error(err)
-	log.G(h.Ctx).Info("\u274C Error description: " + s)
 	w.WriteHeader(http.StatusInternalServerError)
 	w.Write([]byte("Some errors occurred while creating container. Check Docker Sidecar's logs"))
+	cleanupPodData(h, s, err, podNamespace, podUID)
+}
+
+// cleanupPodData tears down the pod data directory and the DIND container,
+// network and subnet claimed for the pod. It never touches the HTTP response, so
+// it is safe to call from the asynchronous container-creation goroutine.
+func cleanupPodData(h *SidecarHandler, s string, err error, podNamespace string, podUID string) {
+	if err != nil {
+		log.G(h.Ctx).Error(err)
+	}
+	log.G(h.Ctx).Info("\u274C Error description: " + s)
 
 	if podNamespace != "" && podUID != "" {
 		os.RemoveAll(h.Config.DataRootFolder + podNamespace + "-" + podUID)
 	}
-	dindSpec := dindmanager.DindSpecs{}
-	dindSpec, err = h.DindManager.GetDindFromPodUID(podUID)
 
-	if err != nil {
-		log.G(h.Ctx).Error("\u274C [CREATE CALL] Error retrieving DindSpecs, maybe the Dind container has already been deleted")
-	} else {
-		log.G(h.Ctx).Info("\u2705 [CREATE CALL] Retrieved DindSpecs: " + dindSpec.DindID + " " + dindSpec.PodUID + " " + dindSpec.DindNetworkID + " ")
+	// Without a pod UID there is no DIND to reconcile (e.g. the body was never
+	// parsed). Bail out here rather than matching an unrelated DIND by "".
+	if podUID == "" {
+		return
+	}
 
-		// log the retrieved dindSpec
-		log.G(h.Ctx).Info("\u2705 [CREATE CALL] Retrieved DindSpecs: " + dindSpec.DindID + " " + dindSpec.PodUID + " " + dindSpec.DindNetworkID + " ")
+	dindSpec, lookupErr := h.DindManager.GetDindFromPodUID(podUID)
+	if lookupErr != nil {
+		log.G(h.Ctx).Info("\u2139\uFE0F  [CREATE CALL] No DIND container assigned to pod " + podUID + " to clean up")
+		return
+	}
 
-		cmd := []string{"network", "rm", dindSpec.DindNetworkID}
-		shell := exec.ExecTask{
-			Command: "docker",
-			Args:    cmd,
-			Shell:   true,
+	log.G(h.Ctx).Info("\u2705 [CREATE CALL] Cleaning up DIND for pod " + podUID + ": " + dindSpec.DindID + " (network " + dindSpec.DindNetworkID + ")")
+
+	// Force-remove the DIND container FIRST. While it is running it holds an
+	// endpoint on its bridge network, so the network cannot be removed and its
+	// /24 subnet stays effectively allocated \u2014 which then causes the next create
+	// drawing that subnet from the pool to fail with an address overlap. The
+	// container may be named after the pod UID (after the rename step) or after
+	// its original build UID (before it); remove both, ignoring "no such
+	// container" errors.
+	for _, name := range []string{podUID + "_dind", dindSpec.DindID} {
+		if name == "" {
+			continue
 		}
-		execReturn, _ := shell.Execute()
-		execReturn.Stdout = strings.ReplaceAll(execReturn.Stdout, "\n", "")
-		if execReturn.Stderr != "" {
-			log.G(h.Ctx).Error("\u274C [CREATE CALL] Error deleting network " + dindSpec.DindNetworkID)
-		} else {
-			log.G(h.Ctx).Info("\u2705 [CREATE CALL] Deleted network " + dindSpec.DindNetworkID)
+		rm := exec.ExecTask{Command: "docker", Args: []string{"rm", "-f", name}, Shell: true}
+		if execReturn, rmErr := rm.Execute(); rmErr != nil || execReturn.ExitCode != 0 {
+			log.G(h.Ctx).Warning("\u26A0\uFE0F  [CREATE CALL] Could not remove DIND container " + name + ": " + strings.TrimSpace(execReturn.Stderr))
 		}
-		// set the dind available again
-		err = h.DindManager.RemoveDindFromList(dindSpec.PodUID)
-		if err != nil {
-			log.G(h.Ctx).Error("\u274C [CREATE CALL] Error setting DIND container available")
-		}
+	}
+
+	// Now that the container is gone, RemoveDindFromList can actually delete the
+	// bridge network and return the subnet to the pool.
+	if remErr := h.DindManager.RemoveDindFromList(dindSpec.PodUID); remErr != nil {
+		log.G(h.Ctx).Error("\u274C [CREATE CALL] Error removing DIND from list: " + remErr.Error())
 	}
 }
