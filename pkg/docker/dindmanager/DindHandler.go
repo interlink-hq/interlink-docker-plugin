@@ -4,14 +4,17 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"net"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	exec "github.com/alexellis/go-execute/pkg/v1"
 	"github.com/containerd/containerd/log"
 
 	OSexec "os/exec"
+	"sync/atomic"
 )
 
 type DindManagerInterface interface {
@@ -19,45 +22,207 @@ type DindManagerInterface interface {
 	BuildDindContainers(nDindContainer int8) error
 	PrintDindList() error
 	GetAvailableDind() (string, error)
+	ClaimAvailableDind(podUID string) (string, error)
 	SetDindUnavailable(dindID string) error
 	RemoveDindFromList(PodUID string) error
 	SetPodUIDToDind(dindID string, podUID string) error
 	GetDindFromPodUID(podUID string) (DindSpecs, error)
 	SetDindAvailable(PodUID string) error
+	ReapOrphanNetworks()
 }
 
 type DindSpecs struct {
-	DindID        string
-	PodUID        string
-	DindNetworkID string
-	Available     bool
+	DindID          string
+	PodUID          string
+	DindNetworkID   string
+	AllocatedSubnet string // empty if no subnet pool was configured
+	Available       bool
 }
 
 type DindManager struct {
-	DindList []DindSpecs
-	Ctx      context.Context
+	DindList        []DindSpecs
+	Ctx             context.Context
+	FPGAEnabled     bool
+	XilinxToolsPath string
+
+	// Subnet pool: pre-generated /24 subnets from the parent CIDRs in config.
+	// Protected by mu because container creation/deletion can happen concurrently.
+	SubnetPool    []string
+	mu            sync.Mutex
+	InitialPoolSz int // total subnets at startup, used for logging
+
+	// listMu protects DindList. Kept separate from mu (which protects SubnetPool)
+	// so that RemoveDindFromList can hold listMu while calling freeSubnet (mu)
+	// without self-deadlock. Lock ordering is always listMu -> mu, never reverse.
+	listMu sync.Mutex
+
+	// buildsInFlight counts in-progress BuildDindContainers calls. The orphan
+	// network reaper checks it so it never removes a bridge network in the brief
+	// window after it is created but before its DIND container attaches to it.
+	buildsInFlight int32
 }
 
-// GenerateUUIDv4 generates a random UUIDv4
+// ---------------------------------------------------------------------------
+// Subnet pool helpers
+// ---------------------------------------------------------------------------
+
+// InitSubnetPool expands a list of parent CIDRs (e.g. ["192.168.0.0/16",
+// "10.12.0.0/16"]) into an ordered slice of allocatable /24 subnets.
+// Supported parent prefix lengths: /8, /16, /24.
+// Returns an empty slice (no error) when parentCIDRs is nil/empty.
+func InitSubnetPool(parentCIDRs []string) ([]string, error) {
+	var pool []string
+	for _, cidr := range parentCIDRs {
+		subnets, err := generateSubnetsFromCIDR(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to expand CIDR %s: %w", cidr, err)
+		}
+		pool = append(pool, subnets...)
+	}
+	return pool, nil
+}
+
+// generateSubnetsFromCIDR returns all usable /24 subnets within parentCIDR.
+//
+//   - /8  → iterates second octet [1-254] × third octet [1-254]  (~64 k subnets)
+//   - /16 → iterates third octet  [1-254]                        (254 subnets)
+//   - /24 → returns the CIDR itself                              (1 subnet)
+func generateSubnetsFromCIDR(cidr string) ([]string, error) {
+	_, ipNet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid CIDR %q: %w", cidr, err)
+	}
+
+	ones, bits := ipNet.Mask.Size()
+	if bits != 32 {
+		return nil, fmt.Errorf("only IPv4 CIDRs are supported (got %s)", cidr)
+	}
+
+	base := ipNet.IP.To4()
+	var subnets []string
+
+	switch ones {
+	case 8:
+		for second := 1; second <= 254; second++ {
+			for third := 1; third <= 254; third++ {
+				subnets = append(subnets, fmt.Sprintf("%d.%d.%d.0/24", base[0], second, third))
+			}
+		}
+	case 16:
+		for third := 1; third <= 254; third++ {
+			subnets = append(subnets, fmt.Sprintf("%d.%d.%d.0/24", base[0], base[1], third))
+		}
+	case 24:
+		subnets = append(subnets, cidr)
+	default:
+		return nil, fmt.Errorf("unsupported prefix length /%d in %s: only /8, /16 and /24 are supported", ones, cidr)
+	}
+
+	return subnets, nil
+}
+
+// allocateSubnet pops the next available subnet from the pool.
+// Returns ("", false) when the pool is empty or was never configured.
+func (a *DindManager) allocateSubnet() (string, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.SubnetPool) == 0 {
+		return "", false
+	}
+	subnet := a.SubnetPool[0]
+	a.SubnetPool = a.SubnetPool[1:]
+	return subnet, true
+}
+
+// freeSubnet returns a subnet to the pool (appended at the end so the pool
+// stays ordered and previously-used ranges are re-used last).
+func (a *DindManager) freeSubnet(subnet string) {
+	if subnet == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.SubnetPool = append(a.SubnetPool, subnet)
+}
+
+// remainingSubnets returns the current pool size (thread-safe).
+func (a *DindManager) remainingSubnets() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.SubnetPool)
+}
+
+// rollbackDind undoes a partially created DIND: it force-removes the container,
+// then its bridge network, and only then returns the subnet to the pool.
+//
+// The order matters. A running container holds an endpoint on its network, so
+// Docker refuses to remove the network while it exists, and a network that still
+// exists keeps owning its /24. Returning the subnet to the pool without tearing
+// those down (as the failure paths used to do) hands out an address range Docker
+// still considers allocated, so the next "docker network create --subnet" for it
+// fails with "Pool overlaps with other one on this address space" — permanently,
+// since ReapOrphanNetworks cannot remove a network whose container is alive.
+func (a *DindManager) rollbackDind(randUID string, allocatedSubnet string) {
+	rm := exec.ExecTask{
+		Command: "docker",
+		Args:    []string{"rm", "-f", randUID + "_dind"},
+		Shell:   true,
+	}
+	if execReturn, err := rm.Execute(); err != nil || execReturn.ExitCode != 0 {
+		log.G(a.Ctx).Warn(fmt.Sprintf("⚠️  Rollback: could not remove container %s_dind: %s",
+			randUID, strings.TrimSpace(execReturn.Stderr)))
+	}
+
+	rmNet := exec.ExecTask{
+		Command: "docker",
+		Args:    []string{"network", "rm", randUID + "_dind_network"},
+		Shell:   true,
+	}
+	execReturn, err := rmNet.Execute()
+	// "not found" means the network is already gone, so the range is free and the
+	// subnet can be recycled: docker network rm is not idempotent and reports it
+	// as a failure.
+	alreadyGone := strings.Contains(execReturn.Stderr, "not found")
+	if (err != nil || execReturn.ExitCode != 0) && !alreadyGone {
+		// The subnet is deliberately NOT returned to the pool in this case: the
+		// network still exists and still owns the range, so reusing it would fail.
+		log.G(a.Ctx).Error(fmt.Sprintf(
+			"❌ Rollback: could not remove network %s_dind_network (%s); subnet %s is leaked rather than returned to the pool to avoid an overlap on reuse",
+			randUID, strings.TrimSpace(execReturn.Stderr), allocatedSubnet))
+		return
+	}
+
+	a.freeSubnet(allocatedSubnet)
+	if allocatedSubnet != "" {
+		log.G(a.Ctx).Info(fmt.Sprintf(
+			"✅ Rollback: subnet %s returned to pool (%d/%d now available)",
+			allocatedSubnet, a.remainingSubnets(), a.InitialPoolSz))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// UUIDv4 generator (unchanged)
+// ---------------------------------------------------------------------------
+
 func GenerateUUIDv4() (string, error) {
 	uuid := make([]byte, 16)
 	_, err := rand.Read(uuid)
 	if err != nil {
 		return "", err
 	}
-
 	uuid[6] = (uuid[6] & 0x0f) | 0x40
 	uuid[8] = (uuid[8] & 0x3f) | 0x80
-
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", uuid[0:4], uuid[4:6], uuid[6:8], uuid[8:10], uuid[10:16]), nil
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		uuid[0:4], uuid[4:6], uuid[6:8], uuid[8:10], uuid[10:16]), nil
 }
 
+// ---------------------------------------------------------------------------
+// DindManager methods
+// ---------------------------------------------------------------------------
+
 func (a *DindManager) CleanDindContainers() error {
+	log.G(a.Ctx).Info("\u2705 Start cleaning zombie DIND containers")
 
-	// print the number of DIND containers to be created
-	log.G(a.Ctx).Info(fmt.Sprintf("\u2705 Start cleaning zombie DIND containers"))
-
-	// exec this command docker ps -a --format "{{.Names}}" | grep '_dind$' | wc -l
 	shell := exec.ExecTask{
 		Command: "docker",
 		Args:    []string{"ps", "-a", "--format", "{{.Names}}", "|", "grep", "_dind$", "|", "wc", "-l"},
@@ -67,257 +232,292 @@ func (a *DindManager) CleanDindContainers() error {
 	if err != nil {
 		return err
 	}
-
-	// log the number of zombie DIND containers (remove the \n at the end of the string)
-	log.G(a.Ctx).Info(fmt.Sprintf("\u2705 %s zombie DIND containers found", strings.ReplaceAll(execReturn.Stdout, "\n", "")))
+	log.G(a.Ctx).Info(fmt.Sprintf("\u2705 %s zombie DIND containers found",
+		strings.ReplaceAll(execReturn.Stdout, "\n", "")))
 
 	shell = exec.ExecTask{
 		Command: "docker",
 		Args:    []string{"ps", "-a", "--format", "{{.Names}}", "|", "grep", "_dind$", "|", "xargs", "-I", "{}", "docker", "rm", "-f", "{}"},
 		Shell:   true,
 	}
-	_, err = shell.Execute()
-	if err != nil {
+	if _, err = shell.Execute(); err != nil {
 		return err
 	}
-
-	// exec this command  docker network ls --filter name=_dind_network$ --format "{{.ID}}" | xargs -r docker network rm
 
 	shell = exec.ExecTask{
 		Command: "docker",
 		Args:    []string{"network", "ls", "--filter", "name=_dind_network$", "--format", "{{.ID}}", "|", "xargs", "-r", "docker", "network", "rm"},
 		Shell:   true,
 	}
-	_, err = shell.Execute()
-	if err != nil {
+	if _, err = shell.Execute(); err != nil {
 		return err
 	}
 
-	log.G(a.Ctx).Info(fmt.Sprintf("\u2705 DIND zombie containers cleaned"))
-
+	log.G(a.Ctx).Info("\u2705 DIND zombie containers cleaned")
 	return nil
 }
 
 func (a *DindManager) BuildDindContainers(nDindContainer int8) error {
+	// Signal to the reaper that a build is running: freshly created networks are
+	// briefly container-less and must not be reaped as "orphans".
+	atomic.AddInt32(&a.buildsInFlight, 1)
+	defer atomic.AddInt32(&a.buildsInFlight, -1)
 
-	// print the number of DIND containers to be created
 	log.G(a.Ctx).Info(fmt.Sprintf("\u2705 Creating %d DIND containers", nDindContainer))
 
-	// get the working dir
+	// Log subnet pool status before we start allocating.
+	if a.InitialPoolSz > 0 {
+		log.G(a.Ctx).Info(fmt.Sprintf(
+			"\u2705 Subnet pool: %d/%d subnets available before container creation",
+			a.remainingSubnets(), a.InitialPoolSz,
+		))
+	} else {
+		log.G(a.Ctx).Info("\u2705 No subnet pool configured — networks will use Docker's automatic addressing")
+	}
+
 	wd, err := os.Getwd()
 	if err != nil {
 		return err
 	}
 
-	// get the env variable GPUENABLED, if 1 then the DIND container will have GPU support, otherwise it will not
-
 	gpuEnabled := os.Getenv("GPUENABLED")
-	dindImage := "docker:dind"
+	dindImage := "docker:29.3.0-dind"
 	if gpuEnabled == "1" {
 		dindImage = "ghcr.io/extrality/nvidia-dind"
 	}
 
 	for i := int8(0); i < nDindContainer; i++ {
 
-		// generate a random UID for the DIND container
 		randUID, err := GenerateUUIDv4()
 		if err != nil {
 			return err
 		}
 
-		// create the networks
+		// ----------------------------------------------------------------
+		// Allocate a /24 subnet for this container's bridge network (if a
+		// pool is configured).
+		// ----------------------------------------------------------------
+		allocatedSubnet, hasSubnet := a.allocateSubnet()
+
+		networkArgs := []string{"network", "create", "--driver", "bridge"}
+		if hasSubnet {
+			networkArgs = append(networkArgs, "--subnet", allocatedSubnet)
+		}
+		networkArgs = append(networkArgs, randUID+"_dind_network")
+
 		shell := exec.ExecTask{
 			Command: "docker",
-			Args:    []string{"network", "create", "--driver", "bridge", randUID + "_dind_network"},
+			Args:    networkArgs,
 			Shell:   true,
 		}
-		_, err = shell.Execute()
-
-		log.G(a.Ctx).Info(fmt.Sprintf("\u2705 DIND network %s created", randUID+"_dind_network"))
-
+		// go-execute returns a nil error for a non-zero exit, so the exit code has to
+		// be checked explicitly. Otherwise a rejected "network create" (typically
+		// "Pool overlaps with other one on this address space") is treated as a
+		// success and the failure only surfaces later, as an unrelated "docker run"
+		// error, with the subnet already considered in use.
+		netReturn, err := shell.Execute()
+		if err == nil && netReturn.ExitCode != 0 {
+			err = fmt.Errorf("docker network create exited with code %d: %s",
+				netReturn.ExitCode, strings.TrimSpace(netReturn.Stderr))
+		}
 		if err != nil {
+			log.G(a.Ctx).Error(fmt.Sprintf("❌ Error creating DIND network %s_dind_network: %v", randUID, err))
+			// The network was not created, so nothing to tear down: just return the
+			// subnet to the pool so it is not lost.
+			a.freeSubnet(allocatedSubnet)
 			return err
 		}
 
+		if hasSubnet {
+			log.G(a.Ctx).Info(fmt.Sprintf(
+				"\u2705 DIND network %s created with subnet %s (%d/%d subnets remaining in pool)",
+				randUID+"_dind_network", allocatedSubnet,
+				a.remainingSubnets(), a.InitialPoolSz,
+			))
+		} else {
+			log.G(a.Ctx).Info(fmt.Sprintf(
+				"\u2705 DIND network %s created (no subnet pool configured)",
+				randUID+"_dind_network",
+			))
+		}
+
+		// ----------------------------------------------------------------
+		// Build the docker-run argument list.
+		// ----------------------------------------------------------------
 		dindContainerArgs := []string{"run"}
-		//dindContainerArgs = append(dindContainerArgs, gpuArgsAsArray...)
+
 		if _, err := os.Stat("/cvmfs"); err == nil {
 			dindContainerArgs = append(dindContainerArgs, "-v", "/cvmfs:/cvmfs")
 		}
 
-		if os.Getenv("FPGAENABLED") == "1" {
-			if _, err := os.Stat("/tools/Xilinx/"); err == nil {
-				dindContainerArgs = append(dindContainerArgs, "-v", "/tools/Xilinx/:/tools/Xilinx/:ro")
+		if a.FPGAEnabled {
+			if _, err := os.Stat(a.XilinxToolsPath); err == nil {
+				dindContainerArgs = append(dindContainerArgs, "-v", a.XilinxToolsPath+":"+a.XilinxToolsPath+":ro")
 			}
 		}
 
-		// add the network to the dind container
 		dindContainerArgs = append(dindContainerArgs, "--network", randUID+"_dind_network")
-
-		// append also --net vk0
-		//dindContainerArgs = append(dindContainerArgs, "--net", "vk0")
 		dindContainerArgs = append(dindContainerArgs, "--cap-add", "NET_ADMIN")
-		// "--runtime=nvidia" is added to the dind container if the GPUENABLED env variable is set to 1
 
 		if gpuEnabled == "1" {
 			dindContainerArgs = append(dindContainerArgs, "--runtime=nvidia")
 		}
-		dindContainerArgs = append(dindContainerArgs, "--privileged", "-v", wd+":/"+wd, "-v", "/home:/home", "-v", "/var/lib/docker/overlay2:/var/lib/docker/overlay2", "-v", "/var/lib/docker/image:/var/lib/docker/image", "-d", "--name", randUID+"_dind", dindImage)
+		dindContainerArgs = append(dindContainerArgs,
+			"--privileged",
+			"-v", wd+":"+"/"+wd,
+			"-v", "/home:/home",
+			"-v", "/var/lib/docker/overlay2:/var/lib/docker/overlay2",
+			"-v", "/var/lib/docker/image:/var/lib/docker/image",
+			"-d", "--name", randUID+"_dind", dindImage,
+		)
 
-		var dindContainerID string
 		shell = exec.ExecTask{
 			Command: "docker",
 			Args:    dindContainerArgs,
 			Shell:   true,
 		}
-
-		// log the command to be executed with docker and the args
 		log.G(a.Ctx).Info(fmt.Sprintf("\u2705 Command is %s", shell.Command+" "+strings.Join(shell.Args, " ")))
 
 		execReturn, err := shell.Execute()
+		// go-execute returns a nil error for a non-zero exit, so the exit code has
+		// to be checked explicitly or a failed "docker run" is silently treated as
+		// a success (empty container ID, then a readiness timeout 20s later).
+		if err == nil && execReturn.ExitCode != 0 {
+			err = fmt.Errorf("docker run exited with code %d: %s",
+				execReturn.ExitCode, strings.TrimSpace(execReturn.Stderr))
+		}
 		if err != nil {
-			log.G(a.Ctx).Error(fmt.Sprintf("\u274c Error creating DIND container %s", randUID+"_dind"))
+			log.G(a.Ctx).Error(fmt.Sprintf("\u274c Error creating DIND container %s: %v", randUID+"_dind", err))
 			log.G(a.Ctx).Error(fmt.Sprintf("\u274c %s", execReturn.Stderr))
+			// Tear down the network (and any half-started container) before the subnet
+			// goes back into the pool.
+			a.rollbackDind(randUID, allocatedSubnet)
 			return err
 		}
-		dindContainerID = execReturn.Stdout
+		dindContainerID := strings.TrimSpace(execReturn.Stdout)
+		if dindContainerID == "" {
+			a.rollbackDind(randUID, allocatedSubnet)
+			return fmt.Errorf("docker run returned an empty container ID for %s (stderr: %s)",
+				randUID+"_dind", strings.TrimSpace(execReturn.Stderr))
+		}
 
-		// create a variable of maximum number of retries
+		// ----------------------------------------------------------------
+		// Wait for the daemon inside the DinD container to be ready.
+		// ----------------------------------------------------------------
 		maxRetries := 20
-		output := []byte{}
-
-		// wait until the dind container is up and running by check that the command docker ps inside of it does not return an error
+		lastOutput := ""
 		for {
-
 			if maxRetries == 0 {
-				return fmt.Errorf("DIND container %s not up and running", dindContainerID)
+				// Surface what the daemon actually logged, otherwise the timeout
+				// is indistinguishable from a container that never started.
+				log.G(a.Ctx).Error(fmt.Sprintf("❌ Last output of \"docker logs %s\": %s",
+					randUID+"_dind", strings.TrimSpace(lastOutput)))
+				a.rollbackDind(randUID, allocatedSubnet)
+				return fmt.Errorf("DIND container %s did not become ready in time", dindContainerID)
 			}
 
 			cmd := OSexec.Command("docker", "logs", randUID+"_dind")
-			output, err = cmd.CombinedOutput()
-
-			if err != nil {
-				time.Sleep(1 * time.Second)
-			}
-
-			if strings.Contains(string(output), "API listen on /var/run/docker.sock") {
+			output, err := cmd.CombinedOutput()
+			lastOutput = string(output)
+			if err == nil && strings.Contains(string(output), "API listen on /var/run/docker.sock") {
 				break
-			} else {
-				time.Sleep(1 * time.Second)
 			}
-
-			maxRetries -= 1
-
+			time.Sleep(1 * time.Second)
+			maxRetries--
 		}
-
 		log.G(a.Ctx).Info(fmt.Sprintf("\u2705 DIND container %s is up and running", dindContainerID))
 
-		shell = exec.ExecTask{
-			Command: "docker",
-			Args:    []string{"exec", randUID + "_dind", "apt-get", "update"},
-			Shell:   true,
-		}
-		_, err = shell.Execute()
-		if err != nil {
-			return err
-		}
-
-		log.G(a.Ctx).Info(fmt.Sprintf("\u2705 Executed apt-get update"))
-
-		shell = exec.ExecTask{
-			Command: "docker",
-			Args:    []string{"exec", randUID + "_dind", "apt-get", "install", "-y", "net-tools"},
-			Shell:   true,
-		}
-		_, err = shell.Execute()
-		if err != nil {
-			return err
+		// ----------------------------------------------------------------
+		// Install required tools inside the DinD container.
+		// ----------------------------------------------------------------
+		for _, pkg := range []string{"net-tools", "iproute2"} {
+			shell = exec.ExecTask{
+				Command: "docker",
+				Args:    []string{"exec", randUID + "_dind", "apt-get", "install", "-y", pkg},
+				Shell:   true,
+			}
+			if _, err = shell.Execute(); err != nil {
+				a.rollbackDind(randUID, allocatedSubnet)
+				return err
+			}
+			log.G(a.Ctx).Info(fmt.Sprintf("\u2705 Installed %s", pkg))
 		}
 
-		log.G(a.Ctx).Info(fmt.Sprintf("\u2705 Installed net-tools"))
-
-		shell = exec.ExecTask{
-			Command: "docker",
-			Args:    []string{"exec", randUID + "_dind", "apt-get", "install", "-y", "iproute2"},
-			Shell:   true,
-		}
-		_, err = shell.Execute()
-		if err != nil {
-			return err
-		}
-
-		// log.G(a.Ctx).Info(fmt.Sprintf("\u2705 Installed iproute2"))
-
-		// // run docker network connet vk0 container-id
-		// shell = exec.ExecTask{
-		// 	Command: "docker",
-		// 	Args:    []string{"network", "connect", "vk0", randUID + "_dind"},
-		// 	Shell:   true,
-		// }
-		// _, err = shell.Execute()
-		// if err != nil {
-		// 	return err
-		// }
-
-		// shell = exec.ExecTask{
-		// 	Command: "docker",
-		// 	Args:    []string{"exec", randUID + "_dind", "docker", "network", "create", "--subnet", "10.244.12.0/24", "-o", "com.docker.network.bridge.name=vk0", "vk0", "-o", "com.docker.network.driver.mtu=1500"},
-		// 	Shell:   true,
-		// }
-		// _, err = shell.Execute()
-		// if err != nil {
-		// 	return err
-		// }
-
-		// log.G(a.Ctx).Info(fmt.Sprintf("\u2705 Created network vk0"))
-
-		// shell = exec.ExecTask{
-		// 	Command: "docker",
-		// 	Args:    []string{"exec", randUID + "_dind", "ip", "link", "set", "to-cluster", "master", "vk0"},
-		// 	Shell:   true,
-		// }
-		// _, err = shell.Execute()
-		// if err != nil {
-		// 	return err
-		// }
-
-		// log.G(a.Ctx).Info(fmt.Sprintf("\u2705 Set vk0 as master"))
-
-		// add the dind container to the list of DIND containers
-		a.DindList = append(a.DindList, DindSpecs{DindID: randUID + "_dind", PodUID: "", DindNetworkID: randUID + "_dind_network", Available: true})
+		// ----------------------------------------------------------------
+		// Register the new DinD in the list.
+		// ----------------------------------------------------------------
+		a.listMu.Lock()
+		a.DindList = append(a.DindList, DindSpecs{
+			DindID:          randUID + "_dind",
+			PodUID:          "",
+			DindNetworkID:   randUID + "_dind_network",
+			AllocatedSubnet: allocatedSubnet, // empty string when no pool
+			Available:       true,
+		})
+		a.listMu.Unlock()
 	}
 
 	return nil
 }
 
 func (a *DindManager) PrintDindList() error {
-	for _, dindSpec := range a.DindList {
-		log.G(a.Ctx).Info(fmt.Sprintf("DindID: %s, PodUID: %s, DindNetworkID: %s, Available: %t", dindSpec.DindID, dindSpec.PodUID, dindSpec.DindNetworkID, dindSpec.Available))
+	a.listMu.Lock()
+	defer a.listMu.Unlock()
+	for _, d := range a.DindList {
+		log.G(a.Ctx).Info(fmt.Sprintf(
+			"DindID: %s, PodUID: %s, DindNetworkID: %s, AllocatedSubnet: %q, Available: %t",
+			d.DindID, d.PodUID, d.DindNetworkID, d.AllocatedSubnet, d.Available,
+		))
 	}
 	return nil
 }
 
 func (a *DindManager) GetDindFromPodUID(podUID string) (DindSpecs, error) {
-	for _, dindSpec := range a.DindList {
-		if dindSpec.PodUID == podUID {
-			return dindSpec, nil
+	a.listMu.Lock()
+	defer a.listMu.Unlock()
+	for _, d := range a.DindList {
+		if d.PodUID == podUID {
+			return d, nil
 		}
 	}
 	return DindSpecs{}, fmt.Errorf("DIND container with PodUID %s not found", podUID)
 }
 
 func (a *DindManager) GetAvailableDind() (string, error) {
-	for _, dindSpec := range a.DindList {
-		if dindSpec.Available {
-			return dindSpec.DindID, nil
+	a.listMu.Lock()
+	defer a.listMu.Unlock()
+	for _, d := range a.DindList {
+		if d.Available {
+			return d.DindID, nil
 		}
 	}
-	return "", fmt.Errorf("No available DIND container")
+	return "", fmt.Errorf("no available DIND container")
+}
+
+// ClaimAvailableDind atomically finds an available DIND container, marks it
+// unavailable, and records the pod UID against it — all under a single lock.
+// Doing this in one step (instead of GetAvailableDind + SetDindUnavailable +
+// SetPodUIDToDind) prevents two concurrent creates from grabbing the same
+// container, and guarantees the DIND is findable by pod UID for cleanup the
+// moment it is claimed, closing the window where a failure would orphan it.
+func (a *DindManager) ClaimAvailableDind(podUID string) (string, error) {
+	a.listMu.Lock()
+	defer a.listMu.Unlock()
+	for i, d := range a.DindList {
+		if d.Available {
+			a.DindList[i].Available = false
+			a.DindList[i].PodUID = podUID
+			return a.DindList[i].DindID, nil
+		}
+	}
+	return "", fmt.Errorf("no available DIND container")
 }
 
 func (a *DindManager) SetDindUnavailable(dindID string) error {
-	for i, dindSpec := range a.DindList {
-		if dindSpec.DindID == dindID {
+	a.listMu.Lock()
+	defer a.listMu.Unlock()
+	for i, d := range a.DindList {
+		if d.DindID == dindID {
 			a.DindList[i].Available = false
 			return nil
 		}
@@ -325,19 +525,23 @@ func (a *DindManager) SetDindUnavailable(dindID string) error {
 	return fmt.Errorf("DIND container %s not found", dindID)
 }
 
-func (a *DindManager) SetDindAvailable(PodUI string) error {
-	for i, dindSpec := range a.DindList {
-		if dindSpec.PodUID == PodUI {
+func (a *DindManager) SetDindAvailable(PodUID string) error {
+	a.listMu.Lock()
+	defer a.listMu.Unlock()
+	for i, d := range a.DindList {
+		if d.PodUID == PodUID {
 			a.DindList[i].Available = true
 			return nil
 		}
 	}
-	return fmt.Errorf("DIND container %s not found", PodUI)
+	return fmt.Errorf("DIND container with PodUID %s not found", PodUID)
 }
 
 func (a *DindManager) SetPodUIDToDind(dindID string, podUID string) error {
-	for i, dindSpec := range a.DindList {
-		if dindSpec.DindID == dindID {
+	a.listMu.Lock()
+	defer a.listMu.Unlock()
+	for i, d := range a.DindList {
+		if d.DindID == dindID {
 			a.DindList[i].PodUID = podUID
 			return nil
 		}
@@ -345,12 +549,82 @@ func (a *DindManager) SetPodUIDToDind(dindID string, podUID string) error {
 	return fmt.Errorf("DIND container %s not found", dindID)
 }
 
-func (a *DindManager) RemoveDindFromList(PodUID string) error {
-	for i, dindSpec := range a.DindList {
-		if dindSpec.PodUID == PodUID {
-			a.DindList = append(a.DindList[:i], a.DindList[i+1:]...)
-			return nil
+// ReapOrphanNetworks removes DIND bridge networks that have no attached
+// container. A create that fails after its network is created leaves such a
+// network behind; because it still holds its /24 subnet, a later create drawing
+// the same subnet from the pool fails with an address-overlap error. Removing
+// only unattached networks is safe: Docker refuses to remove a network still in
+// use by a live DIND container, so those are skipped. The build-in-flight guard
+// avoids racing a network that was just created but whose container has not yet
+// attached.
+func (a *DindManager) ReapOrphanNetworks() {
+	if atomic.LoadInt32(&a.buildsInFlight) > 0 {
+		return
+	}
+	list := exec.ExecTask{
+		Command: "docker",
+		Args:    []string{"network", "ls", "--filter", "name=_dind_network", "--format", "{{.Name}}"},
+		Shell:   true,
+	}
+	execReturn, err := list.Execute()
+	if err != nil || execReturn.ExitCode != 0 {
+		return
+	}
+	for _, name := range strings.Fields(execReturn.Stdout) {
+		rm := exec.ExecTask{
+			Command: "docker",
+			Args:    []string{"network", "rm", name},
+			Shell:   true,
 		}
+		// Fails harmlessly (non-zero exit) if the network still has a live
+		// container attached; only truly orphaned networks are removed.
+		if r, _ := rm.Execute(); r.ExitCode == 0 {
+			log.G(a.Ctx).Info("🧹 Reaped orphan DIND network " + name)
+		}
+	}
+}
+
+// RemoveDindFromList removes the DinD entry associated with PodUID from the
+// in-memory list, tears down its Docker network, and returns its subnet to
+// the pool so it can be reused by future containers.
+func (a *DindManager) RemoveDindFromList(PodUID string) error {
+	a.listMu.Lock()
+	defer a.listMu.Unlock()
+	for i, d := range a.DindList {
+		if d.PodUID != PodUID {
+			continue
+		}
+
+		// Remove the dedicated bridge network from Docker.
+		if d.DindNetworkID != "" {
+			shell := exec.ExecTask{
+				Command: "docker",
+				Args:    []string{"network", "rm", d.DindNetworkID},
+				Shell:   true,
+			}
+			if execReturn, err := shell.Execute(); err != nil {
+				// Log but don't abort — the container may already be gone.
+				log.G(a.Ctx).Warn(fmt.Sprintf(
+					"\u26a0\ufe0f  Could not remove network %s: %s (stderr: %s)",
+					d.DindNetworkID, err, execReturn.Stderr,
+				))
+			} else {
+				log.G(a.Ctx).Info(fmt.Sprintf("\u2705 Removed Docker network %s", d.DindNetworkID))
+			}
+		}
+
+		// Return the subnet to the pool.
+		a.freeSubnet(d.AllocatedSubnet)
+		if d.AllocatedSubnet != "" {
+			log.G(a.Ctx).Info(fmt.Sprintf(
+				"\u2705 Subnet %s returned to pool (%d/%d now available)",
+				d.AllocatedSubnet, a.remainingSubnets(), a.InitialPoolSz,
+			))
+		}
+
+		// Splice the entry out of the list.
+		a.DindList = append(a.DindList[:i], a.DindList[i+1:]...)
+		return nil
 	}
 	return fmt.Errorf("DIND container with PodUID %s not found", PodUID)
 }

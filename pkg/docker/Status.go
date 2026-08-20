@@ -28,7 +28,9 @@ func (h *SidecarHandler) StatusHandler(w http.ResponseWriter, r *http.Request) {
 		attribute.Int64("start.timestamp", start),
 	))
 
-	var resp []commonIL.PodStatus
+	// Initialised (not just declared) so a response in which every pod was skipped
+	// marshals to [] rather than null.
+	resp := []commonIL.PodStatus{}
 	var req []*v1.Pod
 	statusCode := http.StatusOK
 
@@ -50,7 +52,7 @@ func (h *SidecarHandler) StatusHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	for i, pod := range req {
+	for _, pod := range req {
 
 		podUID := string(pod.UID)
 		podNamespace := string(pod.Namespace)
@@ -74,21 +76,51 @@ func (h *SidecarHandler) StatusHandler(w http.ResponseWriter, r *http.Request) {
 
 		//dindUUID := strings.ReplaceAll(execReturn.Stdout, "\n", "")
 		dindUUID := strings.Join(strings.Fields(execReturn.Stdout), "")
-		log.G(h.Ctx).Info("\u2705 [STATUS CALL] UUID of the dind container retrieved successfully: ", dindUUID)
 
-		// if the string is empty or the length of the string is 0, return an error and 404 status code\
-		if len(dindUUID) == 0 || dindUUID == "" {
-			log.G(h.Ctx).Error("\u274C [STATUS CALL] Error retrieving UUID of the dind container")
-			statusCode = http.StatusNotFound
-			w.WriteHeader(statusCode)
-			w.Write([]byte("DIND container with UUID " + dindUUID + " not found. Maybe it was deleted or never existed."))
-			return
+		// go-execute reports a nil error for a non-zero exit, so an unknown container
+		// shows up here as empty stdout. Skip that pod instead of failing the whole
+		// request: interLink asks for the status of every pod on the node in one call,
+		// and answering 404 for the batch left every other pod unreconciled. Reporting
+		// no status for this pod is also safer than inventing a terminal one \u2014 the DIND
+		// is legitimately absent for a short window between the claim and the rename.
+		if dindUUID == "" {
+			log.G(h.Ctx).Warning("\u26A0\uFE0F  [STATUS CALL] No DIND container found for pod " + podUID +
+				" (not created yet, or already deleted); skipping it in this status response")
+			continue
 		}
 
-		resp = append(resp, commonIL.PodStatus{PodName: pod.Name, PodUID: podUID, PodNamespace: podNamespace, JobID: dindUUID})
+		log.G(h.Ctx).Info("\u2705 [STATUS CALL] UUID of the dind container retrieved successfully: ", dindUUID)
+
+		podStatus := commonIL.PodStatus{PodName: pod.Name, PodUID: podUID, PodNamespace: podNamespace, JobID: dindUUID}
+
+		disabledInitContainers := make(map[string]bool)
+		if ann, ok := pod.Annotations["interlink.eu/disable-offload-init-containers"]; ok {
+			for _, name := range strings.Split(ann, ",") {
+				name = strings.TrimSpace(name)
+				if name != "" {
+					disabledInitContainers[name] = true
+				}
+			}
+		}
 
 		// check if the pod has initContainers and get their status
 		for _, container := range pod.Spec.InitContainers {
+
+			if disabledInitContainers[container.Name] {
+				log.G(h.Ctx).Infof("✅ [STATUS CALL] init container %s is marked as non-offloaded, reporting as Completed", container.Name)
+				podStatus.InitContainers = append(podStatus.InitContainers, v1.ContainerStatus{
+					Name:  container.Name,
+					Ready: false,
+					State: v1.ContainerState{
+						Terminated: &v1.ContainerStateTerminated{
+							ExitCode: 0,
+							Reason:   "Completed",
+						},
+					},
+				})
+				continue
+			}
+
 			containerName := podNamespace + "-" + podUID + "-" + container.Name
 			cmd := []string{"exec " + podUID + "_dind" + " docker ps -af name=^" + containerName + "$ --format \"{{.Status}}\""}
 			shell := exec.ExecTask{
@@ -113,9 +145,9 @@ func (h *SidecarHandler) StatusHandler(w http.ResponseWriter, r *http.Request) {
 				log.G(h.Ctx).Info("\u2705 [STATUS CALL] The container " + container.Name + " is in the state: " + initContainerStatus[0])
 
 				if initContainerStatus[0] == "Created" {
-					resp[i].InitContainers = append(resp[i].InitContainers, v1.ContainerStatus{Name: container.Name, State: v1.ContainerState{Waiting: &v1.ContainerStateWaiting{}}, Ready: false})
+					podStatus.InitContainers = append(podStatus.InitContainers, v1.ContainerStatus{Name: container.Name, State: v1.ContainerState{Waiting: &v1.ContainerStateWaiting{}}, Ready: false})
 				} else if initContainerStatus[0] == "Up" {
-					resp[i].InitContainers = append(resp[i].InitContainers, v1.ContainerStatus{Name: container.Name, State: v1.ContainerState{Running: &v1.ContainerStateRunning{}}, Ready: true})
+					podStatus.InitContainers = append(podStatus.InitContainers, v1.ContainerStatus{Name: container.Name, State: v1.ContainerState{Running: &v1.ContainerStateRunning{}}, Ready: true})
 				} else if initContainerStatus[0] == "Exited" {
 					containerExitCode := strings.Split(initContainerStatus[1], "(")
 					exitCode, err := strconv.Atoi(strings.Trim(containerExitCode[1], ")"))
@@ -123,14 +155,36 @@ func (h *SidecarHandler) StatusHandler(w http.ResponseWriter, r *http.Request) {
 						log.G(h.Ctx).Error(err)
 						exitCode = 0
 					}
-					resp[i].InitContainers = append(resp[i].InitContainers, v1.ContainerStatus{Name: container.Name, State: v1.ContainerState{Terminated: &v1.ContainerStateTerminated{ExitCode: int32(exitCode)}}, Ready: false})
+					podStatus.InitContainers = append(podStatus.InitContainers, v1.ContainerStatus{Name: container.Name, State: v1.ContainerState{Terminated: &v1.ContainerStateTerminated{ExitCode: int32(exitCode)}}, Ready: false})
 				}
 			} else {
-				resp[i].InitContainers = append(resp[i].InitContainers, v1.ContainerStatus{Name: container.Name, State: v1.ContainerState{Waiting: &v1.ContainerStateWaiting{}}, Ready: false})
+				podStatus.InitContainers = append(podStatus.InitContainers, v1.ContainerStatus{Name: container.Name, State: v1.ContainerState{Waiting: &v1.ContainerStateWaiting{}}, Ready: false})
+			}
+		}
+
+		disabledContainers := make(map[string]bool)
+		if ann, ok := pod.Annotations["interlink.eu/disable-offload-containers"]; ok {
+			for _, name := range strings.Split(ann, ",") {
+				name = strings.TrimSpace(name)
+				if name != "" {
+					disabledContainers[name] = true
+				}
 			}
 		}
 
 		for _, container := range pod.Spec.Containers {
+
+			if disabledContainers[container.Name] {
+				log.G(h.Ctx).Infof("✅ [STATUS CALL] container %s is marked as non-offloaded, reporting as Running", container.Name)
+				podStatus.Containers = append(podStatus.Containers, v1.ContainerStatus{
+					Name:  container.Name,
+					Ready: true,
+					State: v1.ContainerState{
+						Running: &v1.ContainerStateRunning{},
+					},
+				})
+				continue
+			}
 
 			containerName := podNamespace + "-" + podUID + "-" + container.Name
 			cmd := []string{"exec " + podUID + "_dind" + " docker ps -af name=^" + containerName + "$ --format \"{{.Status}}\""}
@@ -157,9 +211,9 @@ func (h *SidecarHandler) StatusHandler(w http.ResponseWriter, r *http.Request) {
 				log.G(h.Ctx).Info("\u2705 [STATUS CALL] The container " + container.Name + " is in the state: " + containerstatus[0])
 
 				if containerstatus[0] == "Created" {
-					resp[i].Containers = append(resp[i].Containers, v1.ContainerStatus{Name: container.Name, State: v1.ContainerState{Waiting: &v1.ContainerStateWaiting{}}, Ready: false})
+					podStatus.Containers = append(podStatus.Containers, v1.ContainerStatus{Name: container.Name, State: v1.ContainerState{Waiting: &v1.ContainerStateWaiting{}}, Ready: false})
 				} else if containerstatus[0] == "Up" {
-					resp[i].Containers = append(resp[i].Containers, v1.ContainerStatus{Name: container.Name, State: v1.ContainerState{Running: &v1.ContainerStateRunning{}}, Ready: true})
+					podStatus.Containers = append(podStatus.Containers, v1.ContainerStatus{Name: container.Name, State: v1.ContainerState{Running: &v1.ContainerStateRunning{}}, Ready: true})
 				} else if containerstatus[0] == "Exited" {
 					containerExitCode := strings.Split(containerstatus[1], "(")
 					exitCode, err := strconv.Atoi(strings.Trim(containerExitCode[1], ")"))
@@ -167,14 +221,14 @@ func (h *SidecarHandler) StatusHandler(w http.ResponseWriter, r *http.Request) {
 						log.G(h.Ctx).Error(err)
 						exitCode = 0
 					}
-					resp[i].Containers = append(resp[i].Containers, v1.ContainerStatus{Name: container.Name, State: v1.ContainerState{Terminated: &v1.ContainerStateTerminated{ExitCode: int32(exitCode)}}, Ready: false})
-					// release all the GPUs from the container
-					//h.GpuManager.Release(containerName)
+					podStatus.Containers = append(podStatus.Containers, v1.ContainerStatus{Name: container.Name, State: v1.ContainerState{Terminated: &v1.ContainerStateTerminated{ExitCode: int32(exitCode)}}, Ready: false})
 				}
 			} else {
-				resp[i].Containers = append(resp[i].Containers, v1.ContainerStatus{Name: container.Name, State: v1.ContainerState{Waiting: &v1.ContainerStateWaiting{}}, Ready: false})
+				podStatus.Containers = append(podStatus.Containers, v1.ContainerStatus{Name: container.Name, State: v1.ContainerState{Waiting: &v1.ContainerStateWaiting{}}, Ready: false})
 			}
 		}
+
+		resp = append(resp, podStatus)
 	}
 
 	w.WriteHeader(statusCode)

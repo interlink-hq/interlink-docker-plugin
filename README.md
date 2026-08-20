@@ -80,7 +80,12 @@ The main version of the plugin supports the creation of docker containers with G
 CGO_ENABLED=1 GOOS=linux go build -o bin/docker-sd cmd/main.go
 ```
 As you can see, the CGO_ENABLED flag is set to 1, which means that the plugin will be built to allow the GO program to use C code. This is necessary to use the Nvidia GPU libraries.
-In the second case, the command is the following:
+In the second case, it is first necessary to change the branch of the repository with the following command:
+
+```bash
+git checkout 2-light-version-no-gpu
+```
+Then, the command to build the binary executable of the plugin without GPU support is the following:
 
 ```bash
 CGO_ENABLED=0 GOOS=linux go build -o bin/docker-sd cmd/main.go
