@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	OSexec "os/exec"
 
 	exec "github.com/alexellis/go-execute/pkg/v1"
 	"github.com/containerd/containerd/log"
@@ -25,10 +28,49 @@ import (
 	trace "go.opentelemetry.io/otel/trace"
 )
 
+const (
+	// meshReadyTimeoutSeconds bounds how long containers_command.sh waits for the
+	// mesh_ready sentinel written by the network-overlay container.
+	meshReadyTimeoutSeconds = 300
+
+	// containersCommandTimeout bounds the whole containers_command.sh execution
+	// inside the DIND container. It must be larger than meshReadyTimeoutSeconds so
+	// the script gets the chance to report the mesh timeout itself.
+	containersCommandTimeout = 10 * time.Minute
+)
+
+// selectNetworkOverlay splits containers into the network-overlay container and
+// the workload containers that have to wait for the mesh sentinel it writes.
+// ok is false when overlayName is empty (no overlay was built for this pod) or
+// when no container carries that name, in which case overlay is the zero value
+// and workload holds every container unchanged.
+//
+// The overlay is prepended to the list, so it is normally at index 0. Taking it
+// from there unconditionally was the bug: the condition that selected the mesh
+// startup path (the pod carries a mesh annotation) is weaker than the conditions
+// under which the overlay is actually built, so when the two disagreed an
+// ordinary workload container was started as the overlay and every other
+// container waited on a sentinel nothing would ever write. It also panicked on
+// an empty container list. Matching by name makes the two impossible to confuse.
+func selectNetworkOverlay(containers []DockerRunStruct, overlayName string) (overlay DockerRunStruct, workload []DockerRunStruct, ok bool) {
+	if overlayName == "" {
+		return DockerRunStruct{}, containers, false
+	}
+	for idx, c := range containers {
+		if c.Name != overlayName {
+			continue
+		}
+		workload = make([]DockerRunStruct, 0, len(containers)-1)
+		workload = append(workload, containers[:idx]...)
+		workload = append(workload, containers[idx+1:]...)
+		return c, workload, true
+	}
+	return DockerRunStruct{}, containers, false
+}
+
 func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w http.ResponseWriter) ([]DockerRunStruct, error) {
 
 	var dockerRunStructs []DockerRunStruct
-	var fpgaArgs string = ""
 
 	podUID := string(podData.Pod.UID)
 	podNamespace := string(podData.Pod.Namespace)
@@ -78,9 +120,13 @@ func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w 
 	for containerType, containers := range allContainers {
 		isInitContainer := containerType == "initContainers"
 
-		var envVars string = ""
-
 		for _, container := range containers {
+
+			// envVars and fpgaArgs MUST be scoped to the single container: when they
+			// were declared outside this loop every container inherited the -e/-v
+			// flags and --device entries of the containers processed before it.
+			var envVars string = ""
+			var fpgaArgs string = ""
 
 			containerName := podNamespace + "-" + podUID + "-" + container.Name
 
@@ -370,6 +416,14 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Name of the network-overlay container, set below only if one is actually
+		// built and prepended to dockerRunStructs. Everything downstream keys off
+		// this instead of re-testing the annotation: the annotation check and the
+		// overlay creation do not have the same preconditions, and assuming they
+		// agree is what made the startup script treat an ordinary workload container
+		// as the overlay.
+		networkOverlayName := ""
+
 		if preExecAnnotations, ok := data.Pod.Annotations["slurm-job.vk.io/pre-exec"]; ok {
 			if strings.Contains(preExecAnnotations, "cat <<'EOFMESH' > $TMPDIR/mesh.sh") {
 				meshScript, err := extractHeredoc(preExecAnnotations, "EOFMESH")
@@ -479,6 +533,8 @@ cd $TMPDIR
 						IsInitContainer: false,
 						FpgaArgs:        "",
 					}}, dockerRunStructs...)
+
+					networkOverlayName = networkContainerName
 
 					log.G(h.Ctx).Info("✅ [POD FLOW] Network overlay container prepared: " + networkContainerName)
 				} else {
@@ -605,6 +661,17 @@ cd $TMPDIR
 		span.End()
 
 		go func() {
+			// The HTTP response has already been sent at this point, so nothing below
+			// may touch w. A panic here would also not be recovered by net/http (it is
+			// a bare goroutine, not the handler), and would take the whole plugin down
+			// together with the bookkeeping of every other running pod.
+			defer func() {
+				if r := recover(); r != nil {
+					log.G(h.Ctx).Errorf("❌ [POD FLOW] panic while creating containers for pod %s: %v", podUID, r)
+					cleanupPodData(h, "Panic during asynchronous container creation",
+						fmt.Errorf("panic: %v", r), podNamespace, podUID)
+				}
+			}()
 
 			if len(initContainers) > 0 {
 
@@ -633,7 +700,7 @@ cd $TMPDIR
 
 					_, err := shell.Execute()
 					if err != nil {
-						HandleErrorAndRemoveData(h, w, "An error occurred during the exec of the init container command", err, podNamespace, podUID)
+						cleanupPodData(h, "An error occurred during the exec of the init container command", err, podNamespace, podUID)
 						return
 					}
 
@@ -646,7 +713,7 @@ cd $TMPDIR
 
 						statusReturn, err := shell.Execute()
 						if err != nil {
-							HandleErrorAndRemoveData(h, w, "An error occurred during inspect of init container", err, podNamespace, podUID)
+							cleanupPodData(h, "An error occurred during inspect of init container", err, podNamespace, podUID)
 							return
 						}
 
@@ -668,7 +735,14 @@ cd $TMPDIR
 			// create a file called containers_command.sh and write the containers commands to it, use WriteFile function
 			containersCommand := "#!/bin/sh\n"
 
-			if isMeshScriptPresent {
+			networkOverlay, workloadContainers, hasOverlay := selectNetworkOverlay(containers, networkOverlayName)
+
+			if isMeshScriptPresent && !hasOverlay {
+				log.G(h.Ctx).Warning("⚠️  [POD FLOW] Pod " + podUID + " carries a mesh pre-exec annotation but no network-overlay " +
+					"container was created; starting its containers directly, without cluster network setup or cluster DNS")
+			}
+
+			if hasOverlay {
 
 				dnsNameserver := h.FinalDNSNameserver
 				dnsSearch := h.FinalDNSSearch
@@ -680,19 +754,27 @@ cd $TMPDIR
 					dnsSearch = "default.svc.cluster.local svc.cluster.local cluster.local" // Fallback
 				}
 
-				// The first container in the list is the network-overlay; start it immediately.
-				// All subsequent containers are workload containers and must wait for the sentinel.
-				networkOverlay := containers[0]
-				workloadContainers := containers[1:]
-
 				containersCommand += "# Start network overlay container first\n"
 				containersCommand += networkOverlay.Command + "\n\n"
 
-				// Poll for the sentinel file written by mesh.sh once network setup is complete.
-				containersCommand += "echo 'Waiting for network overlay to be ready...'\n"
+				// Poll for the sentinel file written by mesh.sh once network setup is
+				// complete. The wait MUST be bounded: mesh.sh downloads binaries and
+				// brings up WireGuard, and when any of that fails the sentinel is never
+				// written. An unbounded loop left the docker exec below blocked with no
+				// diagnostics, the pod stuck in Waiting and its DIND claimed until a
+				// human deleted the pod. Timing out instead fails the pod loudly and
+				// lets the deferred cleanup reclaim the DIND.
+				containersCommand += "echo 'Waiting for network overlay to be ready (timeout " + strconv.Itoa(meshReadyTimeoutSeconds) + "s)...'\n"
+				containersCommand += "meshWaited=0\n"
 				containersCommand += "while [ ! -f " + meshReadyFile + " ]; do\n"
-				containersCommand += "  echo 'Network not ready yet, waiting 2s...'\n"
+				containersCommand += "  if [ \"$meshWaited\" -ge " + strconv.Itoa(meshReadyTimeoutSeconds) + " ]; then\n"
+				containersCommand += "    echo 'ERROR: network overlay did not become ready after " + strconv.Itoa(meshReadyTimeoutSeconds) + "s; aborting container startup'\n"
+				containersCommand += "    docker logs " + networkOverlay.Name + " 2>&1 | tail -n 50\n"
+				containersCommand += "    exit 1\n"
+				containersCommand += "  fi\n"
+				containersCommand += "  echo \"Network not ready yet, waiting 2s (${meshWaited}s elapsed)...\"\n"
 				containersCommand += "  sleep 2\n"
+				containersCommand += "  meshWaited=$((meshWaited+2))\n"
 				containersCommand += "done\n"
 				containersCommand += "echo 'Network overlay is ready (sentinel file found), starting containers...'\n\n"
 
@@ -722,23 +804,29 @@ cd $TMPDIR
 			err = os.WriteFile(podDirectoryPath+"/containers_command.sh", []byte(containersCommand), 0644)
 			if err != nil {
 				log.G(h.Ctx).Error("\u274C [POD FLOW] Error writing containers command script: " + err.Error())
-				HandleErrorAndRemoveData(h, w, "An error occurred during the creation of the container commands script.", err, podNamespace, podUID)
+				cleanupPodData(h, "An error occurred during the creation of the container commands script.", err, podNamespace, podUID)
 				return
 			}
 
 			log.G(h.Ctx).Info("\u2705 [POD FLOW] Containers commands written to the script file")
 
-			shell = exec.ExecTask{
-				Command: "docker",
-				Args:    []string{"exec", string(data.Pod.UID) + "_dind", "/bin/sh", podDirectoryPath + "/containers_command.sh"},
-			}
+			// Bound the exec as well, so a script that blocks for any other reason
+			// cannot leak this goroutine and keep the DIND claimed forever. Unlike
+			// go-execute, OSexec.CommandContext can be cancelled.
+			execCtx, cancelExec := context.WithTimeout(h.Ctx, containersCommandTimeout)
+			defer cancelExec()
 
-			log.G(h.Ctx).Info("\u2705 [POD FLOW] Executing containers creation script inside DIND container; command to execute: docker " + strings.Join(shell.Args, " "))
+			execArgs := []string{"exec", string(data.Pod.UID) + "_dind", "/bin/sh", podDirectoryPath + "/containers_command.sh"}
+			log.G(h.Ctx).Info("\u2705 [POD FLOW] Executing containers creation script inside DIND container; command to execute: docker " + strings.Join(execArgs, " "))
 
-			_, err = shell.Execute()
+			scriptOutput, err := OSexec.CommandContext(execCtx, "docker", execArgs...).CombinedOutput()
 			if err != nil {
+				if execCtx.Err() == context.DeadlineExceeded {
+					err = fmt.Errorf("containers command script timed out after %s: %w", containersCommandTimeout, err)
+				}
 				log.G(h.Ctx).Error("\u274C [POD FLOW] Error executing containers command script: " + err.Error())
-				HandleErrorAndRemoveData(h, w, "An error occurred during the execution of the container command script", err, podNamespace, podUID)
+				log.G(h.Ctx).Error("\u274C [POD FLOW] Script output: " + strings.TrimSpace(string(scriptOutput)))
+				cleanupPodData(h, "An error occurred during the execution of the container command script", err, podNamespace, podUID)
 				return
 			}
 
@@ -749,11 +837,26 @@ cd $TMPDIR
 
 }
 
+// HandleErrorAndRemoveData reports the failure on the HTTP response and then
+// reclaims everything provisioned for the pod. It may only be called from the
+// request goroutine, before the response has been written; anything running
+// after the handler returned must call cleanupPodData directly, because writing
+// to a ResponseWriter after its handler returned races with the http server and
+// can corrupt the next response on a keep-alive connection.
 func HandleErrorAndRemoveData(h *SidecarHandler, w http.ResponseWriter, s string, err error, podNamespace string, podUID string) {
-	log.G(h.Ctx).Error(err)
-	log.G(h.Ctx).Info("\u274C Error description: " + s)
 	w.WriteHeader(http.StatusInternalServerError)
 	w.Write([]byte("Some errors occurred while creating container. Check Docker Sidecar's logs"))
+	cleanupPodData(h, s, err, podNamespace, podUID)
+}
+
+// cleanupPodData tears down the pod data directory and the DIND container,
+// network and subnet claimed for the pod. It never touches the HTTP response, so
+// it is safe to call from the asynchronous container-creation goroutine.
+func cleanupPodData(h *SidecarHandler, s string, err error, podNamespace string, podUID string) {
+	if err != nil {
+		log.G(h.Ctx).Error(err)
+	}
+	log.G(h.Ctx).Info("\u274C Error description: " + s)
 
 	if podNamespace != "" && podUID != "" {
 		os.RemoveAll(h.Config.DataRootFolder + podNamespace + "-" + podUID)

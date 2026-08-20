@@ -18,11 +18,14 @@ import (
 )
 
 type FPGASpecs struct {
-	BDF           string
-	Shell         string
-	LogicUUID     string
-	deviceID      string
-	ContainerID   string
+	BDF       string
+	Shell     string
+	LogicUUID string
+	deviceID  string
+	// ContainerIDs holds every container currently assigned this FPGA. It is
+	// normally at most one entry; it can hold more than one only when
+	// FPGA_DISABLE_BOOKKEEPING=1 lets containers share a device.
+	ContainerIDs  []string
 	DeviceReady   string
 	DeviceToMount string
 	Available     bool
@@ -238,26 +241,35 @@ func (a *FPGAManager) GetFPGASpecsList() []FPGASpecs {
 	return a.FPGASpecsList
 }
 
+// Assign locks FPGASpecsMutex itself, so it must not be called by a method
+// that already holds it — use assignLocked in that case.
 func (a *FPGAManager) Assign(BDF string, containerID string) error {
+	a.FPGASpecsMutex.Lock()
+	defer a.FPGASpecsMutex.Unlock()
+	return a.assignLocked(BDF, containerID)
+}
+
+// assignLocked adds containerID to the FPGA identified by BDF. Caller must
+// hold FPGASpecsMutex.
+func (a *FPGAManager) assignLocked(BDF string, containerID string) error {
 	for i := range a.FPGASpecsList {
-		if a.FPGASpecsList[i].BDF == BDF {
-			disableBookkeeping := os.Getenv("FPGA_DISABLE_BOOKKEEPING") == "1"
-			if disableBookkeeping {
-				a.FPGASpecsList[i].ContainerID = containerID
-				a.FPGASpecsList[i].Available = false
-				break
-			}
-
-			if !a.FPGASpecsList[i].Available {
-				return fmt.Errorf("FPGA with BDF %s is already in use by container %s", BDF, a.FPGASpecsList[i].ContainerID)
-			}
-
-			a.FPGASpecsList[i].ContainerID = containerID
-			a.FPGASpecsList[i].Available = false
-			break
+		if a.FPGASpecsList[i].BDF != BDF {
+			continue
 		}
+
+		disableBookkeeping := os.Getenv("FPGA_DISABLE_BOOKKEEPING") == "1"
+		if !disableBookkeeping && len(a.FPGASpecsList[i].ContainerIDs) > 0 {
+			return fmt.Errorf("FPGA with BDF %s is already in use by container(s) %v", BDF, a.FPGASpecsList[i].ContainerIDs)
+		}
+
+		// Appending (instead of overwriting) is what makes sharing under
+		// FPGA_DISABLE_BOOKKEEPING actually work: every assignee stays tracked,
+		// so Release can later find each one instead of only the last assignee.
+		a.FPGASpecsList[i].ContainerIDs = append(a.FPGASpecsList[i].ContainerIDs, containerID)
+		a.FPGASpecsList[i].Available = false
+		return nil
 	}
-	return nil
+	return fmt.Errorf("FPGA with BDF %s not found", BDF)
 }
 
 func (a *FPGAManager) Release(containerID string) error {
@@ -266,147 +278,105 @@ func (a *FPGAManager) Release(containerID string) error {
 	defer a.FPGASpecsMutex.Unlock()
 
 	for i := range a.FPGASpecsList {
-		if a.FPGASpecsList[i].ContainerID == containerID {
-
-			if a.FPGASpecsList[i].Available {
+		ids := a.FPGASpecsList[i].ContainerIDs
+		for j, id := range ids {
+			if id != containerID {
 				continue
 			}
-
-			a.FPGASpecsList[i].ContainerID = ""
-			a.FPGASpecsList[i].Available = true
+			a.FPGASpecsList[i].ContainerIDs = append(ids[:j], ids[j+1:]...)
+			if len(a.FPGASpecsList[i].ContainerIDs) == 0 {
+				a.FPGASpecsList[i].Available = true
+			}
+			break
 		}
 	}
 
 	return nil
 }
 
-/* func (a *FPGAManager) GetAvailableFPGAs(numFPGAs int) ([]FPGASpecs, error) {
+// GetAvailableFPGAs locks FPGASpecsMutex itself, so it must not be called by
+// a method that already holds it — use getAvailableFPGAsLocked in that case.
+func (a *FPGAManager) GetAvailableFPGAs(numFPGAs int) ([]FPGASpecs, error) {
 	a.FPGASpecsMutex.Lock()
 	defer a.FPGASpecsMutex.Unlock()
+	return a.getAvailableFPGAsLocked(numFPGAs)
+}
 
+// getAvailableFPGAsLocked picks up to numFPGAs FPGAs. Caller must hold
+// FPGASpecsMutex.
+//
+// Default behavior: only ever return fully-unassigned FPGAs.
+//
+// FPGA_DISABLE_BOOKKEEPING=1 relaxes that so callers can still get an answer
+// once every device is in use: unassigned FPGAs are still preferred, but if
+// there aren't enough, devices already in use are added back, least-shared
+// first (fpgaUsage counts current assignees per BDF via len(ContainerIDs), so
+// it reflects real concurrent sharing, not just "used at all").
+func (a *FPGAManager) getAvailableFPGAsLocked(numFPGAs int) ([]FPGASpecs, error) {
 	var availableFPGAs []FPGASpecs
-	disableBookkeeping := os.Getenv("FPGA_DISABLE_BOOKKEEPING") == "1"
-
-	if disableBookkeeping {
-		fpgaUsage := make(map[string]int)
-		for _, fpga := range a.FPGASpecsList {
-			if fpga.ContainerID != "" {
-				fpgaUsage[fpga.BDF]++
-			} else {
-				// If an unassigned FPGA is found, prioritize it
-				availableFPGAs = append(availableFPGAs, fpga)
-			}
-		}
-
-		if len(availableFPGAs) >= numFPGAs {
-			return availableFPGAs[:numFPGAs], nil
-		}
-
-		// If not enough unassigned FPGAs, find the least assigned ones
-		sort.Slice(a.FPGASpecsList, func(i, j int) bool {
-			return fpgaUsage[a.FPGASpecsList[i].BDF] < fpgaUsage[a.FPGASpecsList[j].BDF]
-		})
-
-		for _, fpga := range a.FPGASpecsList {
-			if len(availableFPGAs) < numFPGAs {
-				availableFPGAs = append(availableFPGAs, fpga)
-			} else {
-				break
-			}
-		}
-
-		if len(availableFPGAs) >= numFPGAs {
-			return availableFPGAs[:numFPGAs], nil
-		}
-
-		return nil, fmt.Errorf("Not enough FPGAs available. Requested: %d, Found: %d", numFPGAs, len(availableFPGAs))
-	}
-
-	// Default behavior: return only available FPGAs
-	for _, fpgaSpec := range a.FPGASpecsList {
-		if fpgaSpec.Available {
-			availableFPGAs = append(availableFPGAs, fpgaSpec)
-			if len(availableFPGAs) == numFPGAs {
-				return availableFPGAs, nil
-			}
-		}
-	}
-
-	return nil, fmt.Errorf("Not enough available FPGAs. Requested: %d, Available: %d", numFPGAs, len(availableFPGAs))
-} */
-
-func (a *FPGAManager) GetAvailableFPGAs(numFPGAs int) ([]FPGASpecs, error) {
-
-	var availableFPGAs []FPGASpecs
-
-	fmt.Println("Checking for available FPGAs")
+	seen := make(map[string]bool)
 
 	disableBookkeeping := os.Getenv("FPGA_DISABLE_BOOKKEEPING") == "1"
 
-	fmt.Println(fmt.Sprintf("FPGA_DISABLE_BOOKKEEPING: %v", disableBookkeeping))
-
-	if disableBookkeeping {
-		fmt.Println("FPGA_DISABLE_BOOKKEEPING is set to 1. Disabling bookkeeping")
-
-		fpgaUsage := make(map[string]int)
-		for _, fpga := range a.FPGASpecsList {
-			if fpga.ContainerID != "" {
-				fpgaUsage[fpga.BDF]++
-			} else {
-				// If an unassigned FPGA is found, prioritize it
-				availableFPGAs = append(availableFPGAs, fpga)
-			}
-		}
-
-		fmt.Println(fmt.Sprintf("FPGA Usage: %v", fpgaUsage))
-
-		if len(availableFPGAs) >= numFPGAs {
-			return availableFPGAs[:numFPGAs], nil
-		}
-
-		// If not enough unassigned FPGAs, find the least assigned ones
-		sort.Slice(a.FPGASpecsList, func(i, j int) bool {
-			return fpgaUsage[a.FPGASpecsList[i].BDF] < fpgaUsage[a.FPGASpecsList[j].BDF]
-		})
-
-		for _, fpga := range a.FPGASpecsList {
-			if len(availableFPGAs) < numFPGAs {
-				availableFPGAs = append(availableFPGAs, fpga)
-			} else {
-				break
-			}
-		}
-
-		if len(availableFPGAs) >= numFPGAs {
-			return availableFPGAs[:numFPGAs], nil
-		}
-
-		return nil, fmt.Errorf("Not enough FPGAs available. Requested: %d, Found: %d", numFPGAs, len(availableFPGAs))
-	}
-
-	for _, fpgaSpec := range a.FPGASpecsList {
-		if fpgaSpec.Available {
-			availableFPGAs = append(availableFPGAs, fpgaSpec)
-			if len(availableFPGAs) == numFPGAs {
-				return availableFPGAs, nil
-			}
+	for _, fpga := range a.FPGASpecsList {
+		if len(fpga.ContainerIDs) == 0 {
+			availableFPGAs = append(availableFPGAs, fpga)
+			seen[fpga.BDF] = true
 		}
 	}
-	return nil, fmt.Errorf("Not enough available FPGAs. Requested: %d, Available: %d", numFPGAs, len(availableFPGAs))
+
+	if len(availableFPGAs) >= numFPGAs {
+		return availableFPGAs[:numFPGAs], nil
+	}
+
+	if !disableBookkeeping {
+		return nil, fmt.Errorf("Not enough available FPGAs. Requested: %d, Available: %d", numFPGAs, len(availableFPGAs))
+	}
+
+	log.G(a.Ctx).Info(fmt.Sprintf("✅ FPGA_DISABLE_BOOKKEEPING is set: only %d/%d unassigned FPGAs found, falling back to sharing least-used devices", len(availableFPGAs), numFPGAs))
+
+	fpgaUsage := make(map[string]int, len(a.FPGASpecsList))
+	for _, fpga := range a.FPGASpecsList {
+		fpgaUsage[fpga.BDF] = len(fpga.ContainerIDs)
+	}
+
+	shared := make([]FPGASpecs, len(a.FPGASpecsList))
+	copy(shared, a.FPGASpecsList)
+	sort.Slice(shared, func(i, j int) bool {
+		return fpgaUsage[shared[i].BDF] < fpgaUsage[shared[j].BDF]
+	})
+
+	for _, fpga := range shared {
+		if seen[fpga.BDF] {
+			// Already included from the unassigned pass above — including it
+			// again would hand the caller the same physical device twice.
+			continue
+		}
+		availableFPGAs = append(availableFPGAs, fpga)
+		seen[fpga.BDF] = true
+		if len(availableFPGAs) == numFPGAs {
+			break
+		}
+	}
+
+	if len(availableFPGAs) >= numFPGAs {
+		return availableFPGAs[:numFPGAs], nil
+	}
+
+	return nil, fmt.Errorf("Not enough FPGAs available. Requested: %d, Found: %d", numFPGAs, len(availableFPGAs))
 }
 
 func (a *FPGAManager) GetAndAssignAvailableFPGAs(numFPGAs int, containerID string) ([]FPGASpecs, error) {
 	a.FPGASpecsMutex.Lock()
 	defer a.FPGASpecsMutex.Unlock()
 
-	fpgaSpecs, err := a.GetAvailableFPGAs(numFPGAs)
+	fpgaSpecs, err := a.getAvailableFPGAsLocked(numFPGAs)
 	if err != nil {
 		return nil, err
 	}
 
 	for _, fpgaSpec := range fpgaSpecs {
-		err = a.Assign(fpgaSpec.BDF, containerID) // ← was fpgaSpec.LogicUUID
-		if err != nil {
+		if err := a.assignLocked(fpgaSpec.BDF, containerID); err != nil {
 			return nil, err
 		}
 	}

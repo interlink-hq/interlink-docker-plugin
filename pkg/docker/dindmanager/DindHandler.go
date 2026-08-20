@@ -152,6 +152,54 @@ func (a *DindManager) remainingSubnets() int {
 	return len(a.SubnetPool)
 }
 
+// rollbackDind undoes a partially created DIND: it force-removes the container,
+// then its bridge network, and only then returns the subnet to the pool.
+//
+// The order matters. A running container holds an endpoint on its network, so
+// Docker refuses to remove the network while it exists, and a network that still
+// exists keeps owning its /24. Returning the subnet to the pool without tearing
+// those down (as the failure paths used to do) hands out an address range Docker
+// still considers allocated, so the next "docker network create --subnet" for it
+// fails with "Pool overlaps with other one on this address space" — permanently,
+// since ReapOrphanNetworks cannot remove a network whose container is alive.
+func (a *DindManager) rollbackDind(randUID string, allocatedSubnet string) {
+	rm := exec.ExecTask{
+		Command: "docker",
+		Args:    []string{"rm", "-f", randUID + "_dind"},
+		Shell:   true,
+	}
+	if execReturn, err := rm.Execute(); err != nil || execReturn.ExitCode != 0 {
+		log.G(a.Ctx).Warn(fmt.Sprintf("⚠️  Rollback: could not remove container %s_dind: %s",
+			randUID, strings.TrimSpace(execReturn.Stderr)))
+	}
+
+	rmNet := exec.ExecTask{
+		Command: "docker",
+		Args:    []string{"network", "rm", randUID + "_dind_network"},
+		Shell:   true,
+	}
+	execReturn, err := rmNet.Execute()
+	// "not found" means the network is already gone, so the range is free and the
+	// subnet can be recycled: docker network rm is not idempotent and reports it
+	// as a failure.
+	alreadyGone := strings.Contains(execReturn.Stderr, "not found")
+	if (err != nil || execReturn.ExitCode != 0) && !alreadyGone {
+		// The subnet is deliberately NOT returned to the pool in this case: the
+		// network still exists and still owns the range, so reusing it would fail.
+		log.G(a.Ctx).Error(fmt.Sprintf(
+			"❌ Rollback: could not remove network %s_dind_network (%s); subnet %s is leaked rather than returned to the pool to avoid an overlap on reuse",
+			randUID, strings.TrimSpace(execReturn.Stderr), allocatedSubnet))
+		return
+	}
+
+	a.freeSubnet(allocatedSubnet)
+	if allocatedSubnet != "" {
+		log.G(a.Ctx).Info(fmt.Sprintf(
+			"✅ Rollback: subnet %s returned to pool (%d/%d now available)",
+			allocatedSubnet, a.remainingSubnets(), a.InitialPoolSz))
+	}
+}
+
 // ---------------------------------------------------------------------------
 // UUIDv4 generator (unchanged)
 // ---------------------------------------------------------------------------
@@ -262,8 +310,20 @@ func (a *DindManager) BuildDindContainers(nDindContainer int8) error {
 			Args:    networkArgs,
 			Shell:   true,
 		}
-		if _, err = shell.Execute(); err != nil {
-			// Return the subnet to the pool so it is not lost on error.
+		// go-execute returns a nil error for a non-zero exit, so the exit code has to
+		// be checked explicitly. Otherwise a rejected "network create" (typically
+		// "Pool overlaps with other one on this address space") is treated as a
+		// success and the failure only surfaces later, as an unrelated "docker run"
+		// error, with the subnet already considered in use.
+		netReturn, err := shell.Execute()
+		if err == nil && netReturn.ExitCode != 0 {
+			err = fmt.Errorf("docker network create exited with code %d: %s",
+				netReturn.ExitCode, strings.TrimSpace(netReturn.Stderr))
+		}
+		if err != nil {
+			log.G(a.Ctx).Error(fmt.Sprintf("❌ Error creating DIND network %s_dind_network: %v", randUID, err))
+			// The network was not created, so nothing to tear down: just return the
+			// subnet to the pool so it is not lost.
 			a.freeSubnet(allocatedSubnet)
 			return err
 		}
@@ -329,13 +389,14 @@ func (a *DindManager) BuildDindContainers(nDindContainer int8) error {
 		if err != nil {
 			log.G(a.Ctx).Error(fmt.Sprintf("\u274c Error creating DIND container %s: %v", randUID+"_dind", err))
 			log.G(a.Ctx).Error(fmt.Sprintf("\u274c %s", execReturn.Stderr))
-			// Free the subnet so it can be reused.
-			a.freeSubnet(allocatedSubnet)
+			// Tear down the network (and any half-started container) before the subnet
+			// goes back into the pool.
+			a.rollbackDind(randUID, allocatedSubnet)
 			return err
 		}
 		dindContainerID := strings.TrimSpace(execReturn.Stdout)
 		if dindContainerID == "" {
-			a.freeSubnet(allocatedSubnet)
+			a.rollbackDind(randUID, allocatedSubnet)
 			return fmt.Errorf("docker run returned an empty container ID for %s (stderr: %s)",
 				randUID+"_dind", strings.TrimSpace(execReturn.Stderr))
 		}
@@ -347,11 +408,11 @@ func (a *DindManager) BuildDindContainers(nDindContainer int8) error {
 		lastOutput := ""
 		for {
 			if maxRetries == 0 {
-				a.freeSubnet(allocatedSubnet)
 				// Surface what the daemon actually logged, otherwise the timeout
 				// is indistinguishable from a container that never started.
 				log.G(a.Ctx).Error(fmt.Sprintf("❌ Last output of \"docker logs %s\": %s",
 					randUID+"_dind", strings.TrimSpace(lastOutput)))
+				a.rollbackDind(randUID, allocatedSubnet)
 				return fmt.Errorf("DIND container %s did not become ready in time", dindContainerID)
 			}
 
@@ -376,7 +437,7 @@ func (a *DindManager) BuildDindContainers(nDindContainer int8) error {
 				Shell:   true,
 			}
 			if _, err = shell.Execute(); err != nil {
-				a.freeSubnet(allocatedSubnet)
+				a.rollbackDind(randUID, allocatedSubnet)
 				return err
 			}
 			log.G(a.Ctx).Info(fmt.Sprintf("\u2705 Installed %s", pkg))
