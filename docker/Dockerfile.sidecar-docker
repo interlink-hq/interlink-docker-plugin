@@ -1,13 +1,34 @@
-FROM golang:1.21 as build-stage
+# The Go version has to satisfy the go directive in go.mod, and the image has to
+# be glibc based: see the CGO note on the build step below.
+FROM golang:1.24 AS build-stage
 
 WORKDIR /app
 COPY .. .
-RUN CGO_ENABLED=0 GOOS=linux go build -o bin/docker-sidecar cmd/main.go
 
-FROM bash:latest as bash-stage
+# The GPU support in pkg/docker/gpustrategies uses github.com/NVIDIA/go-nvml,
+# which is a cgo package, so this cannot be built with CGO_ENABLED=0 — that is
+# what used to break this image.
+#
+# It also cannot be built against musl: go-nvml uses RTLD_DEEPBIND, a glibc-only
+# extension, so an Alpine build fails outright. That is why both this stage and
+# the runtime stage below are Debian based rather than the docker:*-dind image
+# this used to ship, which is Alpine.
+RUN CGO_ENABLED=1 GOOS=linux go build -o bin/docker-sidecar cmd/main.go
 
-# Deploy the application binary into a lean image
-FROM docker:26.1.3-dind AS build-release-stage
+# Deploy the application binary into an image that can also run dockerd.
+# There is no official Debian based docker:dind image, so Docker is installed
+# from Docker's own apt repository.
+FROM debian:bookworm-slim AS build-release-stage
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg iptables uidmap e2fsprogs xfsprogs kmod bash \
+    && install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
+    && chmod a+r /etc/apt/keyrings/docker.asc \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian bookworm stable" > /etc/apt/sources.list.d/docker.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends docker-ce docker-ce-cli containerd.io \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /
 
@@ -17,15 +38,23 @@ RUN mkdir -p /sidecar
 
 COPY --from=build-stage /app/bin/docker-sidecar /sidecar/docker-sidecar
 
-# adding bash binary to be able to perform commands within the sidecar binary
-COPY --from=bash-stage /usr/local/bin/bash /bin 
+# bash is part of the base image here; it no longer has to be copied in from a
+# separate stage the way it did on Alpine.
 
 ENV INTERLINKCONFIGPATH=/InterLinkConfig.yaml
 
-ENV PATH "$PATH:/bin"
+ENV PATH="$PATH:/bin"
 
-#creating a simple startup script to start both docker rootless and the sidecar
-RUN echo -e '#!/bin/bash\ndockerd --mtu=1350 & /sidecar/docker-sidecar' > /sidecar/startup-docker.sh
+# dockerd cannot stack overlayfs on top of the container's own overlay
+# filesystem, so its state directory has to be a volume. The docker:dind image
+# declared this for us; on this base image it has to be declared here, otherwise
+# every container started inside the DIND fails to mount its rootfs.
+VOLUME /var/lib/docker
+
+# creating a simple startup script to start both dockerd and the sidecar.
+# printf, not echo -e: /bin/sh is dash on Debian and would write the "-e" out
+# literally instead of interpreting the escapes.
+RUN printf '#!/bin/bash\ndockerd --mtu=1350 &\nexec /sidecar/docker-sidecar\n' > /sidecar/startup-docker.sh
 RUN chmod +x /sidecar/startup-docker.sh
 
 WORKDIR /sidecar
