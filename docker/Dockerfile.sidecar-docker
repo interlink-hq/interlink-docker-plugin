@@ -1,10 +1,11 @@
-FROM golang:1.21 as build-stage
+# Has to satisfy the go directive in go.mod, which asks for 1.24.
+FROM golang:1.24 AS build-stage
 
 WORKDIR /app
 COPY .. .
 RUN CGO_ENABLED=0 GOOS=linux go build -o bin/docker-sidecar cmd/main.go
 
-FROM bash:latest as bash-stage
+FROM bash:latest AS bash-stage
 
 # Deploy the application binary into a lean image
 FROM docker:26.1.3-dind AS build-release-stage
@@ -22,7 +23,7 @@ COPY --from=bash-stage /usr/local/bin/bash /bin
 
 ENV INTERLINKCONFIGPATH=/InterLinkConfig.yaml
 
-ENV PATH "$PATH:/bin"
+ENV PATH="$PATH:/bin"
 
 #creating a simple startup script to start both docker rootless and the sidecar
 RUN echo -e '#!/bin/bash\ndockerd --mtu=1350 & /sidecar/docker-sidecar' > /sidecar/startup-docker.sh
